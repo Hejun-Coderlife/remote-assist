@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Remote Assist</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="app">
+      <aside class="panel">
+        <div>
+          <p class="eyebrow">Remote Assist</p>
+          <h1>远程协助控制台</h1>
+        </div>
+
+        <form id="connectForm" class="connect">
+          <label>
+            房间号
+            <input id="room" autocomplete="off" placeholder="例如 A1B2C3D4" required />
+          </label>
+          <label>
+            口令
+            <input id="secret" autocomplete="off" placeholder="被控端显示的口令" required type="password" />
+          </label>
+          <button type="submit">连接</button>
+        </form>
+
+        <div class="status">
+          <span id="dot" class="dot"></span>
+          <span id="statusText">未连接</span>
+        </div>
+
+        <div class="controls">
+          <label class="check">
+            <input id="enableInput" type="checkbox" checked />
+            允许发送鼠标和键盘
+          </label>
+          <input id="textInput" placeholder="输入文字后回车发送" />
+          <textarea id="clipboardBox" placeholder="远程复制内容会出现在这里，也可在这里粘贴后点远程粘贴"></textarea>
+          <div class="row">
+            <button id="sendCtrlAltDel" type="button">Ctrl+Alt+Del</button>
+            <button id="disconnect" type="button">断开</button>
+          </div>
+          <div class="row">
+            <button id="smoothMode" type="button" class="secondary">流畅模式</button>
+            <button id="clearMode" type="button" class="secondary">清晰模式</button>
+          </div>
+          <div class="row">
+            <button id="remoteCopy" type="button" class="secondary">远程复制</button>
+            <button id="remotePaste" type="button" class="secondary">远程粘贴</button>
+          </div>
+          <button id="fullscreen" type="button" class="secondary">全屏查看</button>
+        </div>
+      </aside>
+
+      <section class="viewer">
+        <div id="screenWrap" class="screen-wrap">
+          <img id="screen" alt="remote screen" draggable="false" />
+          <div id="empty" class="empty">等待被控端共享屏幕</div>
+          <textarea id="imeInput" aria-label="remote input"></textarea>
+        </div>
+      </section>
+    </main>
+
+    <script src="/static/app.js?v=17"></script>
+  </body>
+</html>
