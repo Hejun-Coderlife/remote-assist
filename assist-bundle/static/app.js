@@ -847,13 +847,21 @@ async function paintLatestFrame() {
     adaptiveSmoothVpnLagGuard(header.timestamp);
     adaptiveSmoothTick(header.timestamp);
   }
-  latestFrameBlob = blob;
   screenWrap.style.setProperty("--screen-ratio", `${header.width} / ${header.height}`);
 
-  if (screenImg.width !== header.width) screenImg.width = header.width;
-  if (screenImg.height !== header.height) screenImg.height = header.height;
-  screenCtx.drawImage(bitmap, 0, 0);
+  const fullFrame = header.full !== false;
+  const regionX = Math.max(0, Math.floor(header.regionX || 0));
+  const regionY = Math.max(0, Math.floor(header.regionY || 0));
+  const regionWidth = Math.max(1, Math.floor(header.regionWidth || header.width));
+  const regionHeight = Math.max(1, Math.floor(header.regionHeight || header.height));
+  if (screenImg.width !== header.width || screenImg.height !== header.height || fullFrame) {
+    if (screenImg.width !== header.width) screenImg.width = header.width;
+    if (screenImg.height !== header.height) screenImg.height = header.height;
+    if (fullFrame) screenCtx.clearRect(0, 0, header.width, header.height);
+  }
+  screenCtx.drawImage(bitmap, regionX, regionY, regionWidth, regionHeight);
   bitmap.close();
+  latestFrameBlob = null;
   screenImg.style.display = "block";
   empty.style.display = "none";
   const profilesNow = getSmoothProfiles();
@@ -1170,24 +1178,35 @@ clearMode.addEventListener("click", activateClearMode);
 inputModeToggle.addEventListener("click", toggleLanguage);
 
 saveScreenshot.addEventListener("click", async () => {
-  if (!latestFrameBlob) {
+  if (!screenImg.width || !screenImg.height) {
     setStatus("No screen frame to save yet", false);
     return;
   }
-  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const link = document.createElement("a");
-  const url = URL.createObjectURL(latestFrameBlob);
-  link.href = url;
-  link.download = `remote-screenshot-${stamp}.jpg`;
-  document.body.append(link);
-  link.click();
-  link.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
-  setStatus("Screenshot saved to Downloads", true);
-  saveScreenshot.textContent = "Saved";
-  setTimeout(() => {
-    saveScreenshot.textContent = tr("saveScreenshot");
-  }, 1500);
+  screenImg.toBlob(
+    (blob) => {
+      if (!blob) {
+        setStatus("Screenshot failed", false);
+        return;
+      }
+      latestFrameBlob = blob;
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const link = document.createElement("a");
+      const url = URL.createObjectURL(blob);
+      link.href = url;
+      link.download = `remote-screenshot-${stamp}.jpg`;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setStatus("Screenshot saved to Downloads", true);
+      saveScreenshot.textContent = "Saved";
+      setTimeout(() => {
+        saveScreenshot.textContent = tr("saveScreenshot");
+      }, 1500);
+    },
+    "image/jpeg",
+    0.95,
+  );
 });
 
 uploadFile.addEventListener("click", async () => {

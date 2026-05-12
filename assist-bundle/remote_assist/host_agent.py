@@ -18,7 +18,7 @@ import mss
 import pyautogui
 import pyperclip
 import websockets
-from PIL import Image
+from PIL import Image, ImageChops
 
 
 pyautogui.FAILSAFE = True
@@ -77,50 +77,96 @@ class SharedState:
     screen: ScreenState | None = None
 
 
+@dataclass
+class EncodedFrame:
+    jpeg: bytes
+    state: ScreenState
+    stream_size: tuple[int, int]
+    region: tuple[int, int, int, int]
+    full: bool
+    changed: bool = True
+
+
 def encode_frame(
     sct: mss.mss,
     monitor: dict[str, int],
     quality: int,
     max_width: int,
     jpeg_subsampling: int = 2,
-) -> tuple[bytes, ScreenState, tuple[int, int]]:
+    *,
+    previous_image: Image.Image | None = None,
+    force_full: bool = False,
+) -> tuple[EncodedFrame | None, Image.Image]:
     shot = sct.grab(monitor)
     image = Image.frombytes("RGB", shot.size, shot.rgb)
     if max_width > 0 and image.width > max_width:
         height = round(image.height * (max_width / image.width))
         image = image.resize((max_width, height), Image.Resampling.BILINEAR)
-    buffer = io.BytesIO()
-    sub = 0 if jpeg_subsampling == 0 else 2
-    image.save(buffer, format="JPEG", quality=quality, optimize=False, subsampling=sub)
     state = ScreenState(
         left=monitor["left"],
         top=monitor["top"],
         width=monitor["width"],
         height=monitor["height"],
     )
-    return buffer.getvalue(), state, image.size
+
+    full = force_full or previous_image is None or previous_image.size != image.size
+    bbox = (0, 0, image.width, image.height)
+    if not full:
+        diff_bbox = ImageChops.difference(previous_image, image).getbbox()
+        if diff_bbox is None:
+            return None, image
+        changed_area = (diff_bbox[2] - diff_bbox[0]) * (diff_bbox[3] - diff_bbox[1])
+        full = changed_area / max(1, image.width * image.height) > 0.55
+        if not full:
+            pad = 16
+            bbox = (
+                max(0, diff_bbox[0] - pad),
+                max(0, diff_bbox[1] - pad),
+                min(image.width, diff_bbox[2] + pad),
+                min(image.height, diff_bbox[3] + pad),
+            )
+
+    region_image = image if full else image.crop(bbox)
+    buffer = io.BytesIO()
+    sub = 0 if jpeg_subsampling == 0 else 2
+    region_quality = quality if full else min(95, quality + 6)
+    region_image.save(buffer, format="JPEG", quality=region_quality, optimize=False, subsampling=sub)
+    return (
+        EncodedFrame(
+            jpeg=buffer.getvalue(),
+            state=state,
+            stream_size=image.size,
+            region=bbox,
+            full=full,
+        ),
+        image,
+    )
 
 
 def pack_frame(
-    jpeg: bytes,
-    state: ScreenState,
-    stream_size: tuple[int, int],
+    frame: EncodedFrame,
     *,
     frame_timestamp: float | None = None,
 ) -> bytes:
     ts = time.time() if frame_timestamp is None else frame_timestamp
+    x1, y1, x2, y2 = frame.region
     header = json.dumps(
         {
             "type": "frame",
-            "width": stream_size[0],
-            "height": stream_size[1],
-            "sourceWidth": state.width,
-            "sourceHeight": state.height,
+            "width": frame.stream_size[0],
+            "height": frame.stream_size[1],
+            "sourceWidth": frame.state.width,
+            "sourceHeight": frame.state.height,
+            "regionX": x1,
+            "regionY": y1,
+            "regionWidth": x2 - x1,
+            "regionHeight": y2 - y1,
+            "full": frame.full,
             "timestamp": ts,
         },
         separators=(",", ":"),
     ).encode("utf-8")
-    return struct.pack(">I", len(header)) + header + jpeg
+    return struct.pack(">I", len(header)) + header + frame.jpeg
 
 
 def scale_point(state: ScreenState, x: float, y: float) -> tuple[int, int]:
@@ -183,17 +229,36 @@ def handle_control(payload: dict, state: ScreenState | None, allow_keyboard: boo
 
 async def sender(ws, monitor_index: int, shared: SharedState) -> None:
     last_status = 0.0
+    previous_image: Image.Image | None = None
+    last_full_frame_at = 0.0
+    last_mode_signature: tuple[int, int, int] | None = None
     with mss.mss() as sct:
         monitor = sct.monitors[monitor_index]
         while True:
             started = time.monotonic()
             frame_t0 = time.time()
             settings = shared.settings
-            frame, state, stream_size = encode_frame(
-                sct, monitor, settings.quality, settings.max_width, settings.jpeg_subsampling
+            mode_signature = (settings.quality, settings.max_width, settings.jpeg_subsampling)
+            force_full = (
+                previous_image is None
+                or mode_signature != last_mode_signature
+                or started - last_full_frame_at > 2.5
             )
-            await ws.send(pack_frame(frame, state, stream_size, frame_timestamp=frame_t0))
-            shared.screen = state
+            encoded, previous_image = encode_frame(
+                sct,
+                monitor,
+                settings.quality,
+                settings.max_width,
+                settings.jpeg_subsampling,
+                previous_image=previous_image,
+                force_full=force_full,
+            )
+            last_mode_signature = mode_signature
+            if encoded is not None:
+                await ws.send(pack_frame(encoded, frame_timestamp=frame_t0))
+                shared.screen = encoded.state
+                if encoded.full:
+                    last_full_frame_at = started
 
             if started - last_status > 3:
                 await ws.send(json.dumps({"type": "status", "message": "host sharing screen"}))
