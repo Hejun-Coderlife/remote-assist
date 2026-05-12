@@ -172,6 +172,16 @@ def pack_frame(
 def scale_point(state: ScreenState, x: float, y: float) -> tuple[int, int]:
     screen_x = round(state.left + max(0.0, min(1.0, x)) * state.width)
     screen_y = round(state.top + max(0.0, min(1.0, y)) * state.height)
+    right = state.left + state.width - 1
+    bottom = state.top + state.height - 1
+    if state.width > 4:
+        screen_x = max(state.left + 2, min(right - 2, screen_x))
+    else:
+        screen_x = max(state.left, min(right, screen_x))
+    if state.height > 4:
+        screen_y = max(state.top + 2, min(bottom - 2, screen_y))
+    else:
+        screen_y = max(state.top, min(bottom, screen_y))
     return screen_x, screen_y
 
 
@@ -301,7 +311,10 @@ async def receiver(ws, allow_keyboard: bool, shared: SharedState) -> None:
                         break
                 await ws.send(json.dumps({"type": "clipboard", "text": text}))
             else:
-                handle_control(payload, shared.screen, allow_keyboard)
+                try:
+                    handle_control(payload, shared.screen, allow_keyboard)
+                except pyautogui.FailSafeException:
+                    print("Ignored PyAutoGUI fail-safe control event.", file=sys.stderr)
 
 
 async def run(args: argparse.Namespace) -> None:
