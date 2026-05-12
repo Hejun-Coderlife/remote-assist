@@ -8,6 +8,7 @@ const secretInput = document.querySelector("#secret");
 const statusText = document.querySelector("#statusText");
 const dot = document.querySelector("#dot");
 const screenImg = document.querySelector("#screen");
+const webrtcVideo = document.querySelector("#webrtcVideo");
 const empty = document.querySelector("#empty");
 const enableInput = document.querySelector("#enableInput");
 const enableInputLabel = document.querySelector("#enableInputLabel");
@@ -33,6 +34,9 @@ const screenCtx = screenImg.getContext("2d", { alpha: false });
 
 let socket = null;
 let controlSocket = null;
+let webrtcSocket = null;
+let peerConnection = null;
+let webrtcActive = false;
 let lastMouseMove = 0;
 let lastMouseClientX = null;
 let lastMouseClientY = null;
@@ -391,6 +395,89 @@ function sendStreamFeedback({ header, decodeMs, paintMs, droppedFrames, receiveG
       },
     }),
   );
+}
+
+function sendControlRaw(event) {
+  const target = controlSocket?.readyState === WebSocket.OPEN ? controlSocket : socket;
+  if (target?.readyState === WebSocket.OPEN) {
+    target.send(JSON.stringify({ type: "control", event }));
+  }
+}
+
+function setJpegFallbackEnabled(enabled) {
+  sendControlRaw({ kind: "jpeg_stream", enabled });
+}
+
+function closeWebRtc() {
+  webrtcActive = false;
+  if (webrtcSocket) {
+    webrtcSocket.close();
+    webrtcSocket = null;
+  }
+  if (peerConnection) {
+    peerConnection.close();
+    peerConnection = null;
+  }
+  if (webrtcVideo.srcObject) {
+    for (const track of webrtcVideo.srcObject.getTracks()) track.stop();
+    webrtcVideo.srcObject = null;
+  }
+  webrtcVideo.style.display = "none";
+  if (screenImg.width && screenImg.height) screenImg.style.display = "block";
+  setJpegFallbackEnabled(true);
+}
+
+function waitForIceGathering(pc) {
+  if (pc.iceGatheringState === "complete") return Promise.resolve();
+  return new Promise((resolve) => {
+    const done = () => {
+      if (pc.iceGatheringState !== "complete") return;
+      pc.removeEventListener("icegatheringstatechange", done);
+      resolve();
+    };
+    pc.addEventListener("icegatheringstatechange", done);
+    setTimeout(resolve, 1200);
+  });
+}
+
+function startWebRtc(room, secret) {
+  closeWebRtc();
+  if (!("RTCPeerConnection" in window)) return;
+  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  const url = `${protocol}//${location.host}/ws/webrtc_controller/${encodeURIComponent(room)}?secret=${encodeURIComponent(secret)}`;
+  webrtcSocket = new WebSocket(url);
+  webrtcSocket.addEventListener("message", async (event) => {
+    if (typeof event.data !== "string") return;
+    const payload = JSON.parse(event.data);
+    if (payload.type === "offer") {
+      if (peerConnection) peerConnection.close();
+      const pc = new RTCPeerConnection({ iceServers: [] });
+      peerConnection = pc;
+      pc.addEventListener("track", (trackEvent) => {
+        webrtcVideo.srcObject = trackEvent.streams[0] || new MediaStream([trackEvent.track]);
+      });
+      pc.addEventListener("connectionstatechange", () => {
+        if (["failed", "closed", "disconnected"].includes(pc.connectionState)) {
+          closeWebRtc();
+        }
+      });
+      await pc.setRemoteDescription({ type: "offer", sdp: payload.sdp });
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      await waitForIceGathering(pc);
+      if (webrtcSocket?.readyState === WebSocket.OPEN) {
+        webrtcSocket.send(
+          JSON.stringify({
+            type: pc.localDescription.type,
+            sdp: pc.localDescription.sdp,
+          }),
+        );
+      }
+    }
+  });
+  webrtcSocket.addEventListener("close", () => {
+    if (webrtcActive) closeWebRtc();
+  });
 }
 
 const textDecoder = new TextDecoder();
@@ -784,6 +871,7 @@ document.addEventListener(
 function connect(room, secret) {
   if (socket) socket.close();
   if (controlSocket) controlSocket.close();
+  closeWebRtc();
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
   const url = `${protocol}//${location.host}/ws/controller/${encodeURIComponent(room)}?secret=${encodeURIComponent(secret)}`;
   const controlUrl = `${protocol}//${location.host}/ws/controller_control/${encodeURIComponent(room)}?secret=${encodeURIComponent(secret)}`;
@@ -792,6 +880,7 @@ function connect(room, secret) {
   controlSocket = new WebSocket(controlUrl);
   controlSocket.addEventListener("open", () => {
     sendStreamMode(currentStreamMode);
+    startWebRtc(room, secret);
   });
   controlSocket.addEventListener("message", (event) => {
     if (typeof event.data !== "string") return;
@@ -907,8 +996,10 @@ async function paintLatestFrame() {
     receiveGapMs: lastReceiveGapMs,
   });
   latestFrameBlob = null;
-  screenImg.style.display = "block";
-  empty.style.display = "none";
+  if (!webrtcActive) {
+    screenImg.style.display = "block";
+    empty.style.display = "none";
+  }
   const profilesNow = getSmoothProfiles();
   const tierInfo = adaptiveSmoothEnabled
     ? idleBoostActive
@@ -987,12 +1078,30 @@ function sendStreamMode(mode) {
 }
 
 function normalizedPoint(pointerEvent) {
-  const rect = screenImg.getBoundingClientRect();
+  const rect = (webrtcActive ? webrtcVideo : screenImg).getBoundingClientRect();
   return {
     x: (pointerEvent.clientX - rect.left) / rect.width,
     y: (pointerEvent.clientY - rect.top) / rect.height,
   };
 }
+
+webrtcVideo.addEventListener("playing", () => {
+  webrtcActive = true;
+  if (webrtcVideo.videoWidth && webrtcVideo.videoHeight) {
+    screenWrap.style.setProperty("--screen-ratio", `${webrtcVideo.videoWidth} / ${webrtcVideo.videoHeight}`);
+  }
+  screenImg.style.display = "none";
+  webrtcVideo.style.display = "block";
+  empty.style.display = "none";
+  setJpegFallbackEnabled(false);
+  setStatus(`WebRTC video active ${webrtcVideo.videoWidth || ""}x${webrtcVideo.videoHeight || ""}`, true);
+});
+
+webrtcVideo.addEventListener("resize", () => {
+  if (webrtcVideo.videoWidth && webrtcVideo.videoHeight) {
+    screenWrap.style.setProperty("--screen-ratio", `${webrtcVideo.videoWidth} / ${webrtcVideo.videoHeight}`);
+  }
+});
 
 form.addEventListener("submit", (event) => {
   event.preventDefault();
@@ -1043,6 +1152,55 @@ screenImg.addEventListener("contextmenu", (event) => {
 });
 
 screenImg.addEventListener(
+  "wheel",
+  (event) => {
+    event.preventDefault();
+    sendControl({ kind: "scroll", dy: event.deltaY < 0 ? 4 : -4 });
+  },
+  { passive: false },
+);
+
+webrtcVideo.addEventListener("mousemove", (event) => {
+  const now = performance.now();
+  if (now - lastMouseMove < 10) return;
+  if (
+    !mouseIsDown &&
+    lastMouseClientX !== null &&
+    lastMouseClientY !== null &&
+    Math.abs(event.clientX - lastMouseClientX) < 2 &&
+    Math.abs(event.clientY - lastMouseClientY) < 2
+  ) {
+    return;
+  }
+  lastMouseClientX = event.clientX;
+  lastMouseClientY = event.clientY;
+  lastMouseMove = now;
+  sendControl({ kind: "move", ...normalizedPoint(event) });
+});
+
+webrtcVideo.addEventListener("mousedown", (event) => {
+  event.preventDefault();
+  focusRemoteInput();
+  mouseIsDown = true;
+  sendControl({ kind: "mouse_down", button: event.button === 2 ? "right" : "left", ...normalizedPoint(event) });
+});
+
+webrtcVideo.addEventListener("mouseup", (event) => {
+  event.preventDefault();
+  mouseIsDown = false;
+  sendControl({ kind: "mouse_up", button: event.button === 2 ? "right" : "left", ...normalizedPoint(event) });
+});
+
+webrtcVideo.addEventListener("click", (event) => {
+  event.preventDefault();
+  focusRemoteInput();
+});
+
+webrtcVideo.addEventListener("contextmenu", (event) => {
+  event.preventDefault();
+});
+
+webrtcVideo.addEventListener(
   "wheel",
   (event) => {
     event.preventDefault();
@@ -1292,6 +1450,7 @@ for (const dropTarget of [document.body, screenWrap]) {
 disconnectButton.addEventListener("click", () => {
   if (socket) socket.close();
   if (controlSocket) controlSocket.close();
+  closeWebRtc();
 });
 
 fullscreenButton.addEventListener("click", async () => {
@@ -1311,7 +1470,7 @@ document.addEventListener("fullscreenchange", () => {
 window.addEventListener("mouseup", (event) => {
   if (!mouseIsDown) return;
   mouseIsDown = false;
-  if (event.target === screenImg) return;
+  if (event.target === screenImg || event.target === webrtcVideo) return;
   sendControl({ kind: "mouse_up", button: "left", ...normalizedPoint(event) });
 });
 

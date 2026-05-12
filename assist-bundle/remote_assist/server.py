@@ -42,6 +42,8 @@ class Room:
     secret: str
     host: WebSocket | None = None
     host_control: WebSocket | None = None
+    webrtc_host: WebSocket | None = None
+    webrtc_controllers: set[WebSocket] = field(default_factory=set)
     controllers: set[WebSocket] = field(default_factory=set)
     last_frame: bytes | None = None
 
@@ -157,6 +159,18 @@ async def broadcast_bytes(room: Room, payload: bytes) -> None:
             room.controllers.discard(ws)
 
 
+async def broadcast_webrtc(room: Room, payload: dict[str, Any]) -> None:
+    stale: list[WebSocket] = []
+    data = json.dumps(payload)
+    for controller in list(room.webrtc_controllers):
+        try:
+            await controller.send_text(data)
+        except Exception:
+            stale.append(controller)
+    for controller in stale:
+        room.webrtc_controllers.discard(controller)
+
+
 @app.websocket("/ws/host/{room_id}")
 async def host_socket(
     websocket: WebSocket,
@@ -270,6 +284,46 @@ async def host_control_socket(
                 room.host_control = None
 
 
+@app.websocket("/ws/webrtc_host/{room_id}")
+async def webrtc_host_socket(
+    websocket: WebSocket,
+    room_id: str,
+    secret: str = Query(min_length=6),
+) -> None:
+    await websocket.accept()
+    async with rooms_lock:
+        room = rooms.get(room_id)
+        if room and room.secret != secret:
+            await send_json_safe(websocket, {"type": "error", "message": "room already exists with a different secret"})
+            await websocket.close(code=1008)
+            return
+        if room is None:
+            room = Room(secret=secret)
+            rooms[room_id] = room
+        if room.webrtc_host is not None:
+            await send_json_safe(websocket, {"type": "error", "message": "webrtc host already connected"})
+            await websocket.close(code=1008)
+            return
+        room.webrtc_host = websocket
+
+    await send_json_safe(websocket, {"type": "ready", "room": room_id, "channel": "webrtc_host"})
+    await broadcast_webrtc(room, {"type": "webrtc_status", "online": True})
+
+    try:
+        while True:
+            payload = json.loads(await websocket.receive_text())
+            if payload.get("type") in {"offer", "candidate", "status"}:
+                await broadcast_webrtc(room, payload)
+    except (WebSocketDisconnect, json.JSONDecodeError, RuntimeError):
+        pass
+    finally:
+        async with rooms_lock:
+            active = rooms.get(room_id)
+            if active is room:
+                room.webrtc_host = None
+                await broadcast_webrtc(room, {"type": "webrtc_status", "online": False})
+
+
 @app.websocket("/ws/controller/{room_id}")
 async def controller_socket(
     websocket: WebSocket,
@@ -308,6 +362,39 @@ async def controller_socket(
                 room.controllers.discard(websocket)
                 if room.host is None and not room.controllers:
                     rooms.pop(room_id, None)
+
+
+@app.websocket("/ws/webrtc_controller/{room_id}")
+async def webrtc_controller_socket(
+    websocket: WebSocket,
+    room_id: str,
+    secret: str = Query(min_length=6),
+) -> None:
+    await websocket.accept()
+    async with rooms_lock:
+        room = rooms.get(room_id)
+        if room is None or room.secret != secret:
+            await send_json_safe(websocket, {"type": "error", "message": "invalid room or secret"})
+            await websocket.close(code=1008)
+            return
+        room.webrtc_controllers.add(websocket)
+        webrtc_host = room.webrtc_host
+
+    await send_json_safe(websocket, {"type": "ready", "channel": "webrtc_controller"})
+    await send_json_safe(websocket, {"type": "webrtc_status", "online": webrtc_host is not None})
+
+    try:
+        while True:
+            payload = json.loads(await websocket.receive_text())
+            if payload.get("type") in {"answer", "candidate", "status"} and room.webrtc_host is not None:
+                await send_json_safe(room.webrtc_host, payload)
+    except (WebSocketDisconnect, json.JSONDecodeError, RuntimeError):
+        pass
+    finally:
+        async with rooms_lock:
+            active = rooms.get(room_id)
+            if active is room:
+                room.webrtc_controllers.discard(websocket)
 
 
 @app.websocket("/ws/controller_control/{room_id}")

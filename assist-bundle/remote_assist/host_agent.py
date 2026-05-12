@@ -20,6 +20,18 @@ import pyperclip
 import websockets
 from PIL import Image, ImageChops
 
+try:
+    from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
+    from av import VideoFrame
+
+    WEBRTC_AVAILABLE = True
+except Exception:
+    RTCPeerConnection = None
+    RTCSessionDescription = None
+    VideoFrame = None
+    VideoStreamTrack = object
+    WEBRTC_AVAILABLE = False
+
 
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0
@@ -75,6 +87,7 @@ class StreamSettings:
 class SharedState:
     settings: StreamSettings
     screen: ScreenState | None = None
+    jpeg_enabled: bool = True
     client_extra_lag_ms: float = 0.0
     client_decode_ms: float = 0.0
     client_dropped_frames: int = 0
@@ -277,6 +290,12 @@ async def sender(ws, monitor_index: int, shared: SharedState) -> None:
             started = time.monotonic()
             frame_t0 = time.time()
             settings = effective_stream_settings(shared.settings, shared)
+            if not shared.jpeg_enabled:
+                if started - last_status > 3:
+                    await ws.send(json.dumps({"type": "status", "message": "webrtc video active; jpeg fallback paused"}))
+                    last_status = started
+                await asyncio.sleep(max(0.05, 1 / max(1, settings.fps)))
+                continue
             mode_signature = (settings.quality, settings.max_width, settings.jpeg_subsampling)
             force_full = (
                 previous_image is None
@@ -331,6 +350,8 @@ async def receiver(ws, allow_keyboard: bool, shared: SharedState) -> None:
                 js = event.get("jpegSubsampling", event.get("jpeg_subsampling"))
                 if js is not None:
                     shared.settings.jpeg_subsampling = 0 if int(js) == 0 else 2
+            elif event.get("kind") == "jpeg_stream":
+                shared.jpeg_enabled = bool(event.get("enabled", True))
             elif event.get("kind") == "stream_feedback":
                 shared.client_extra_lag_ms = float(event.get("extraLagMs", 0) or 0)
                 shared.client_decode_ms = float(event.get("decodeMs", 0) or 0)
@@ -360,6 +381,86 @@ async def receiver(ws, allow_keyboard: bool, shared: SharedState) -> None:
                     handle_control(payload, shared.screen, allow_keyboard)
                 except pyautogui.FailSafeException:
                     print("Ignored PyAutoGUI fail-safe control event.", file=sys.stderr)
+
+
+class ScreenVideoTrack(VideoStreamTrack):
+    kind = "video"
+
+    def __init__(self, monitor_index: int, shared: SharedState):
+        super().__init__()
+        self.monitor_index = monitor_index
+        self.shared = shared
+        self.sct: mss.mss | None = None
+        self.monitor: dict[str, int] | None = None
+
+    async def recv(self):
+        pts, time_base = await self.next_timestamp()
+        if self.sct is None:
+            self.sct = mss.mss()
+            self.monitor = self.sct.monitors[self.monitor_index]
+        assert self.monitor is not None
+        shot = self.sct.grab(self.monitor)
+        image = Image.frombytes("RGB", shot.size, shot.rgb)
+        settings = effective_stream_settings(self.shared.settings, self.shared)
+        if settings.max_width > 0 and image.width > settings.max_width:
+            height = round(image.height * (settings.max_width / image.width))
+            image = image.resize((settings.max_width, height), Image.Resampling.BILINEAR)
+        self.shared.screen = ScreenState(
+            left=self.monitor["left"],
+            top=self.monitor["top"],
+            width=self.monitor["width"],
+            height=self.monitor["height"],
+        )
+        frame = VideoFrame.from_image(image)
+        frame.pts = pts
+        frame.time_base = time_base
+        return frame
+
+
+async def run_webrtc_host(args: argparse.Namespace, room: str, secret: str, shared: SharedState) -> None:
+    if not WEBRTC_AVAILABLE:
+        print("WebRTC video disabled: install aiortc in the bundled Python runtime.", file=sys.stderr)
+        return
+
+    url = f"{args.relay.rstrip('/')}/ws/webrtc_host/{quote(room)}?secret={quote(secret)}"
+    while True:
+        pc = RTCPeerConnection()
+        try:
+            async with websockets.connect(
+                url,
+                max_size=2 * 1024 * 1024,
+                max_queue=4,
+                compression=None,
+                ping_interval=20,
+                ping_timeout=60,
+            ) as ws:
+                pc.addTrack(ScreenVideoTrack(args.monitor, shared))
+                offer = await pc.createOffer()
+                await pc.setLocalDescription(offer)
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": pc.localDescription.type,
+                            "sdp": pc.localDescription.sdp,
+                        }
+                    )
+                )
+
+                async for message in ws:
+                    payload = json.loads(message)
+                    if payload.get("type") == "answer":
+                        await pc.setRemoteDescription(
+                            RTCSessionDescription(sdp=payload["sdp"], type=payload["type"])
+                        )
+                    elif payload.get("type") == "candidate":
+                        continue
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            print(f"WebRTC video disconnected: {exc}. Retrying in 2s...", file=sys.stderr)
+            await asyncio.sleep(2)
+        finally:
+            await pc.close()
 
 
 async def run(args: argparse.Namespace) -> None:
@@ -405,14 +506,19 @@ async def run(args: argparse.Namespace) -> None:
                         jpeg_subsampling=args.jpeg_subsampling,
                     )
                 )
-                await asyncio.gather(
+                tasks = [
                     sender(
                         ws,
                         monitor_index=args.monitor,
                         shared=shared,
                     ),
                     receiver(control_ws, allow_keyboard=not args.no_keyboard, shared=shared),
-                )
+                ]
+                if args.webrtc != "off" and WEBRTC_AVAILABLE:
+                    tasks.append(run_webrtc_host(args, room, secret, shared))
+                elif args.webrtc != "off":
+                    print("WebRTC video unavailable; continuing with JPEG fallback.", file=sys.stderr)
+                await asyncio.gather(*tasks)
         except KeyboardInterrupt:
             raise
         except Exception as exc:
@@ -437,6 +543,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--monitor", type=int, default=1, help="mss monitor index")
     parser.add_argument("--no-keyboard", action="store_true", help="disable remote keyboard input")
+    parser.add_argument("--webrtc", choices=("auto", "off"), default="auto", help="enable optional WebRTC video when aiortc is installed")
     return parser.parse_args()
 
 
