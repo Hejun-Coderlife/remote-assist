@@ -29,6 +29,7 @@ const fileStatus = document.querySelector("#fileStatus");
 const fileList = document.querySelector("#fileList");
 const filesTitle = document.querySelector("#filesTitle");
 const filesDescription = document.querySelector("#filesDescription");
+const screenCtx = screenImg.getContext("2d", { alpha: false });
 
 let socket = null;
 let controlSocket = null;
@@ -38,7 +39,7 @@ let lastMouseClientY = null;
 let mouseIsDown = false;
 let pendingFrame = null;
 let framePaintScheduled = false;
-let currentObjectUrl = null;
+let latestFrameBlob = null;
 let composing = false;
 let lastCompositionAt = 0;
 let currentStreamMode = {
@@ -62,12 +63,27 @@ let lastClientFrameAtForVpn = 0;
 let minHostLagSec = Infinity;
 let lastHostLagExtraSec = 0;
 
-/** 闲置自动升清：3 秒无远端操作即推顶档；任何操作立刻回到自适应 */
-const IDLE_BOOST_DELAY_MS = 3000;
+/** 闲置自动升清：1 秒先提到中清，3 秒推满清；任何操作立刻回到低延迟 */
+const IDLE_MID_BOOST_DELAY_MS = 1000;
+const IDLE_FULL_BOOST_DELAY_MS = 3000;
 /**
  * idle 顶档：兼顾「字够清」与「单帧体积小，回切迅速」。
  * 帧大体积 ≈ 80-120KB，2Mbps VPN ~ 400ms 即可送完，回切自适应时不会感觉拖泥带水。
  */
+const interactiveProfile = {
+  label: "Smooth mode (interactive)",
+  fps: 12,
+  quality: 62,
+  maxWidth: 1280,
+  jpegSubsampling: 2,
+};
+const idleMidBoostProfile = {
+  label: "Smooth mode (idle mid-q)",
+  fps: 10,
+  quality: 86,
+  maxWidth: 1600,
+  jpegSubsampling: 2,
+};
 const idleBoostProfile = {
   label: "Smooth mode (idle hi-q)",
   fps: 8,
@@ -77,6 +93,7 @@ const idleBoostProfile = {
 };
 let lastUserActivityAt = 0;
 let idleBoostActive = false;
+let idleBoostStage = "none";
 let idleCheckTimer = null;
 let preIdleAdaptiveIndex = -1;
 
@@ -89,31 +106,42 @@ function clearIdleTimer() {
 
 function scheduleIdleCheck() {
   clearIdleTimer();
-  if (!adaptiveSmoothEnabled || idleBoostActive) return;
+  if (!adaptiveSmoothEnabled || idleBoostStage === "full") return;
   const since = performance.now() - lastUserActivityAt;
-  const remaining = Math.max(0, IDLE_BOOST_DELAY_MS - since);
+  const targetDelay =
+    idleBoostStage === "mid" ? IDLE_FULL_BOOST_DELAY_MS : IDLE_MID_BOOST_DELAY_MS;
+  const remaining = Math.max(0, targetDelay - since);
   idleCheckTimer = setTimeout(() => {
     idleCheckTimer = null;
-    if (!adaptiveSmoothEnabled || idleBoostActive) return;
-    if (performance.now() - lastUserActivityAt >= IDLE_BOOST_DELAY_MS) {
-      applyIdleBoost();
+    if (!adaptiveSmoothEnabled || idleBoostStage === "full") return;
+    const idleMs = performance.now() - lastUserActivityAt;
+    if (idleMs >= IDLE_FULL_BOOST_DELAY_MS) {
+      applyIdleBoost("full");
+    } else if (idleMs >= IDLE_MID_BOOST_DELAY_MS) {
+      applyIdleBoost("mid");
+      scheduleIdleCheck();
     } else {
       scheduleIdleCheck();
     }
   }, remaining + 30);
 }
 
-function applyIdleBoost() {
-  if (!adaptiveSmoothEnabled || idleBoostActive) return;
-  preIdleAdaptiveIndex =
-    adaptiveProfileIndex >= 0 ? adaptiveProfileIndex : getSmoothAdaptiveTune().startIndex;
+function applyIdleBoost(stage = "full") {
+  if (!adaptiveSmoothEnabled) return;
+  if (idleBoostStage === stage || idleBoostStage === "full") return;
+  if (idleBoostStage === "none") {
+    preIdleAdaptiveIndex =
+      adaptiveProfileIndex >= 0 ? adaptiveProfileIndex : getSmoothAdaptiveTune().startIndex;
+  }
   idleBoostActive = true;
-  sendStreamMode(idleBoostProfile);
+  idleBoostStage = stage;
+  sendStreamMode(stage === "mid" ? idleMidBoostProfile : idleBoostProfile);
 }
 
 function restoreFromIdleBoost() {
-  if (!idleBoostActive) return;
+  if (idleBoostStage === "none") return;
   idleBoostActive = false;
+  idleBoostStage = "none";
   if (!adaptiveSmoothEnabled) return;
   resetAdaptiveStats();
   const restoreIdx = Math.min(
@@ -128,6 +156,24 @@ function markUserActivity() {
   lastUserActivityAt = performance.now();
   if (idleBoostActive) restoreFromIdleBoost();
   scheduleIdleCheck();
+}
+
+function streamModeMatches(profile) {
+  const subs = profile.jpegSubsampling === 0 ? 0 : 2;
+  return (
+    currentStreamMode.label === profile.label &&
+    currentStreamMode.fps === profile.fps &&
+    currentStreamMode.quality === profile.quality &&
+    currentStreamMode.maxWidth === profile.maxWidth &&
+    currentStreamMode.jpegSubsampling === subs
+  );
+}
+
+function applyInteractiveProfileForControl() {
+  if (!adaptiveSmoothEnabled || streamModeMatches(interactiveProfile)) return;
+  resetAdaptiveStats();
+  adaptiveProfileIndex = getSmoothAdaptiveTune().startIndex;
+  sendStreamMode(interactiveProfile);
 }
 
 const networkPathKey = "remoteAssistNetPath";
@@ -208,6 +254,7 @@ function onNetPathChange() {
   if (hint) hint.textContent = tr("netPathHint");
   resetAdaptiveStats();
   idleBoostActive = false;
+  idleBoostStage = "none";
   clearIdleTimer();
   if (adaptiveSmoothEnabled) {
     adaptiveProfileIndex = -1;
@@ -753,19 +800,21 @@ function connect(room, secret) {
   });
 }
 
-function decodeFrame(buffer) {
+async function decodeFrame(buffer) {
   const view = new DataView(buffer);
   const headerLength = view.getUint32(0);
   const headerBytes = new Uint8Array(buffer, 4, headerLength);
   const header = JSON.parse(textDecoder.decode(headerBytes));
   const jpeg = buffer.slice(4 + headerLength);
+  const blob = new Blob([jpeg], { type: "image/jpeg" });
   return {
     header,
-    url: URL.createObjectURL(new Blob([jpeg], { type: "image/jpeg" })),
+    blob,
+    bitmap: await createImageBitmap(blob),
   };
 }
 
-function paintLatestFrame() {
+async function paintLatestFrame() {
   framePaintScheduled = false;
   if (!pendingFrame) return;
 
@@ -783,25 +832,34 @@ function paintLatestFrame() {
 
   const buf = pendingFrame;
   pendingFrame = null;
-  const { header, url } = decodeFrame(buf);
+  let decoded;
+  try {
+    decoded = await decodeFrame(buf);
+  } catch {
+    if (pendingFrame) {
+      framePaintScheduled = true;
+      requestAnimationFrame(paintLatestFrame);
+    }
+    return;
+  }
+  const { header, blob, bitmap } = decoded;
   if (adaptiveSmoothEnabled && typeof header.timestamp === "number") {
     adaptiveSmoothVpnLagGuard(header.timestamp);
     adaptiveSmoothTick(header.timestamp);
   }
-  const previousUrl = currentObjectUrl;
-  currentObjectUrl = url;
+  latestFrameBlob = blob;
   screenWrap.style.setProperty("--screen-ratio", `${header.width} / ${header.height}`);
 
-  screenImg.onload = () => {
-    if (previousUrl) URL.revokeObjectURL(previousUrl);
-  };
-  screenImg.src = url;
+  if (screenImg.width !== header.width) screenImg.width = header.width;
+  if (screenImg.height !== header.height) screenImg.height = header.height;
+  screenCtx.drawImage(bitmap, 0, 0);
+  bitmap.close();
   screenImg.style.display = "block";
   empty.style.display = "none";
   const profilesNow = getSmoothProfiles();
   const tierInfo = adaptiveSmoothEnabled
     ? idleBoostActive
-      ? ` | idle hi-q ${currentStreamMode.fps}fps q${currentStreamMode.quality} ${currentStreamMode.maxWidth || "full"}w`
+      ? ` | ${idleBoostStage} idle ${currentStreamMode.fps}fps q${currentStreamMode.quality} ${currentStreamMode.maxWidth || "full"}w`
       : ` | tier ${adaptiveProfileIndex + 1}/${profilesNow.length} ${currentStreamMode.fps}fps q${currentStreamMode.quality} ${currentStreamMode.maxWidth || "full"}w lag+${lastHostLagExtraSec.toFixed(2)}s`
     : "";
   setStatus(
@@ -844,8 +902,11 @@ function sendControl(event) {
   if (!enableInput.checked) return;
   const target = controlSocket?.readyState === WebSocket.OPEN ? controlSocket : socket;
   if (!target || target.readyState !== WebSocket.OPEN) return;
+  if (adaptiveSmoothEnabled) {
+    markUserActivity();
+    applyInteractiveProfileForControl();
+  }
   target.send(JSON.stringify({ type: "control", event }));
-  if (adaptiveSmoothEnabled) markUserActivity();
 }
 
 function sendStreamMode(mode) {
@@ -1072,6 +1133,7 @@ sendCtrlAltDel.addEventListener("click", () => {
 function activateSmoothMode() {
   adaptiveSmoothEnabled = true;
   idleBoostActive = false;
+  idleBoostStage = "none";
   adaptiveProfileIndex = -1;
   resetAdaptiveStats();
   applySmoothAdaptiveProfile(getSmoothAdaptiveTune().startIndex);
@@ -1082,6 +1144,7 @@ function activateSmoothMode() {
 function activateClearMode() {
   adaptiveSmoothEnabled = false;
   idleBoostActive = false;
+  idleBoostStage = "none";
   clearIdleTimer();
   resetAdaptiveStats();
   sendStreamMode({
@@ -1107,17 +1170,19 @@ clearMode.addEventListener("click", activateClearMode);
 inputModeToggle.addEventListener("click", toggleLanguage);
 
 saveScreenshot.addEventListener("click", async () => {
-  if (!currentObjectUrl) {
+  if (!latestFrameBlob) {
     setStatus("No screen frame to save yet", false);
     return;
   }
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   const link = document.createElement("a");
-  link.href = currentObjectUrl;
+  const url = URL.createObjectURL(latestFrameBlob);
+  link.href = url;
   link.download = `remote-screenshot-${stamp}.jpg`;
   document.body.append(link);
   link.click();
   link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
   setStatus("Screenshot saved to Downloads", true);
   saveScreenshot.textContent = "Saved";
   setTimeout(() => {
