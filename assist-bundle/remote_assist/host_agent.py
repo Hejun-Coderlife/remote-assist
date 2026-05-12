@@ -75,6 +75,10 @@ class StreamSettings:
 class SharedState:
     settings: StreamSettings
     screen: ScreenState | None = None
+    client_extra_lag_ms: float = 0.0
+    client_decode_ms: float = 0.0
+    client_dropped_frames: int = 0
+    last_feedback_at: float = 0.0
 
 
 @dataclass
@@ -169,6 +173,31 @@ def pack_frame(
     return struct.pack(">I", len(header)) + header + frame.jpeg
 
 
+def effective_stream_settings(settings: StreamSettings, shared: SharedState) -> StreamSettings:
+    age = time.monotonic() - shared.last_feedback_at
+    if age > 1.5:
+        return settings
+
+    lag_ms = max(0.0, shared.client_extra_lag_ms)
+    decode_ms = max(0.0, shared.client_decode_ms)
+    drops = max(0, shared.client_dropped_frames)
+    if lag_ms >= 450 or decode_ms >= 140 or drops >= 3:
+        return StreamSettings(
+            fps=min(settings.fps, 8),
+            quality=min(settings.quality, 70),
+            max_width=1280 if settings.max_width == 0 else min(settings.max_width, 1280),
+            jpeg_subsampling=2,
+        )
+    if lag_ms >= 220 or decode_ms >= 80 or drops >= 1:
+        return StreamSettings(
+            fps=min(settings.fps, 10),
+            quality=min(settings.quality, 78),
+            max_width=1440 if settings.max_width == 0 else min(settings.max_width, 1440),
+            jpeg_subsampling=2,
+        )
+    return settings
+
+
 def scale_point(state: ScreenState, x: float, y: float) -> tuple[int, int]:
     screen_x = round(state.left + max(0.0, min(1.0, x)) * state.width)
     screen_y = round(state.top + max(0.0, min(1.0, y)) * state.height)
@@ -247,7 +276,7 @@ async def sender(ws, monitor_index: int, shared: SharedState) -> None:
         while True:
             started = time.monotonic()
             frame_t0 = time.time()
-            settings = shared.settings
+            settings = effective_stream_settings(shared.settings, shared)
             mode_signature = (settings.quality, settings.max_width, settings.jpeg_subsampling)
             force_full = (
                 previous_image is None
@@ -271,7 +300,18 @@ async def sender(ws, monitor_index: int, shared: SharedState) -> None:
                     last_full_frame_at = started
 
             if started - last_status > 3:
-                await ws.send(json.dumps({"type": "status", "message": "host sharing screen"}))
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "status",
+                            "message": (
+                                "host sharing screen"
+                                f" lag+{shared.client_extra_lag_ms:.0f}ms"
+                                f" decode{shared.client_decode_ms:.0f}ms"
+                            ),
+                        }
+                    )
+                )
                 last_status = started
 
             elapsed = time.monotonic() - started
@@ -291,6 +331,11 @@ async def receiver(ws, allow_keyboard: bool, shared: SharedState) -> None:
                 js = event.get("jpegSubsampling", event.get("jpeg_subsampling"))
                 if js is not None:
                     shared.settings.jpeg_subsampling = 0 if int(js) == 0 else 2
+            elif event.get("kind") == "stream_feedback":
+                shared.client_extra_lag_ms = float(event.get("extraLagMs", 0) or 0)
+                shared.client_decode_ms = float(event.get("decodeMs", 0) or 0)
+                shared.client_dropped_frames = int(event.get("droppedFrames", 0) or 0)
+                shared.last_feedback_at = time.monotonic()
             elif event.get("kind") in {"copy", "cut"} and allow_keyboard:
                 before = ""
                 try:

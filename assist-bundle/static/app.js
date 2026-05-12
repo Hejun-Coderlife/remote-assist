@@ -40,6 +40,9 @@ let mouseIsDown = false;
 let pendingFrame = null;
 let framePaintScheduled = false;
 let latestFrameBlob = null;
+let pendingFrameDrops = 0;
+let lastStreamFeedbackAt = 0;
+let lastReceiveGapMs = 0;
 let composing = false;
 let lastCompositionAt = 0;
 let currentStreamMode = {
@@ -244,6 +247,9 @@ function resetAdaptiveStats() {
   vpnReceiveGapsMs.length = 0;
   minHostLagSec = Infinity;
   lastHostLagExtraSec = 0;
+  pendingFrameDrops = 0;
+  lastStreamFeedbackAt = 0;
+  lastReceiveGapMs = 0;
 }
 
 function onNetPathChange() {
@@ -361,6 +367,30 @@ function adaptiveSmoothVpnLagGuard(hostTimestampSec) {
     vpnReceiveGapsMs.length = 0;
     applySmoothAdaptiveProfile(target);
   }
+}
+
+function sendStreamFeedback({ header, decodeMs, paintMs, droppedFrames, receiveGapMs }) {
+  if (!adaptiveSmoothEnabled || typeof header.timestamp !== "number") return;
+  const now = performance.now();
+  const severe = lastHostLagExtraSec * 1000 > 220 || decodeMs > 80 || droppedFrames > 0;
+  if (!severe && now - lastStreamFeedbackAt < 650) return;
+  if (severe && now - lastStreamFeedbackAt < 220) return;
+  lastStreamFeedbackAt = now;
+  const target = controlSocket?.readyState === WebSocket.OPEN ? controlSocket : socket;
+  if (target?.readyState !== WebSocket.OPEN) return;
+  target.send(
+    JSON.stringify({
+      type: "control",
+      event: {
+        kind: "stream_feedback",
+        extraLagMs: Math.max(0, Math.round(lastHostLagExtraSec * 1000)),
+        decodeMs: Math.round(decodeMs),
+        paintMs: Math.round(paintMs),
+        droppedFrames,
+        receiveGapMs: Math.round(receiveGapMs || 0),
+      },
+    }),
+  );
 }
 
 const textDecoder = new TextDecoder();
@@ -792,6 +822,7 @@ function connect(room, secret) {
       return;
     }
 
+    if (pendingFrame) pendingFrameDrops += 1;
     pendingFrame = event.data;
     if (!framePaintScheduled) {
       framePaintScheduled = true;
@@ -825,6 +856,7 @@ async function paintLatestFrame() {
       if (g > 2 && g < 8000) {
         vpnReceiveGapsMs.push(g);
         if (vpnReceiveGapsMs.length > 15) vpnReceiveGapsMs.shift();
+        lastReceiveGapMs = g;
       }
     }
     lastClientFrameAtForVpn = receiveAt;
@@ -832,7 +864,10 @@ async function paintLatestFrame() {
 
   const buf = pendingFrame;
   pendingFrame = null;
+  const droppedFrames = pendingFrameDrops;
+  pendingFrameDrops = 0;
   let decoded;
+  const decodeStart = performance.now();
   try {
     decoded = await decodeFrame(buf);
   } catch {
@@ -842,11 +877,13 @@ async function paintLatestFrame() {
     }
     return;
   }
+  const decodeMs = performance.now() - decodeStart;
   const { header, blob, bitmap } = decoded;
   if (adaptiveSmoothEnabled && typeof header.timestamp === "number") {
     adaptiveSmoothVpnLagGuard(header.timestamp);
     adaptiveSmoothTick(header.timestamp);
   }
+  const paintStart = performance.now();
   screenWrap.style.setProperty("--screen-ratio", `${header.width} / ${header.height}`);
 
   const fullFrame = header.full !== false;
@@ -861,6 +898,14 @@ async function paintLatestFrame() {
   }
   screenCtx.drawImage(bitmap, regionX, regionY, regionWidth, regionHeight);
   bitmap.close();
+  const paintMs = performance.now() - paintStart;
+  sendStreamFeedback({
+    header,
+    decodeMs,
+    paintMs,
+    droppedFrames,
+    receiveGapMs: lastReceiveGapMs,
+  });
   latestFrameBlob = null;
   screenImg.style.display = "block";
   empty.style.display = "none";
