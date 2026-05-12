@@ -1,0 +1,8 @@
+node_modules/
+release/
+dist/
+bundled-runtime/
+__pycache__/
+*.pyc
+*.log
+.DS_Store

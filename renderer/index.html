@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>远程协助</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="top">
+      <h1>远程协助</h1>
+      <button type="button" class="btn ghost" id="btn-settings">设置</button>
+    </header>
+
+    <main class="card">
+      <p class="hint">在「控制端」那台电脑上，用浏览器打开下面这个网址：</p>
+      <p class="fineprint" id="url-hint"></p>
+      <div class="url-row">
+        <div class="url-box" id="control-url">—</div>
+        <button type="button" class="btn" id="btn-copy-url">复制</button>
+        <button type="button" class="btn" id="btn-open-url">打开</button>
+      </div>
+      <div class="btn-row" id="cfst-row">
+        <button type="button" class="btn ghost small" id="btn-cfst-optimize" disabled>
+          优选 Cloudflare（测速并写本机 hosts）
+        </button>
+        <button type="button" class="btn ghost small" id="btn-cfst-remove" disabled>
+          清除本机优选记录
+        </button>
+      </div>
+      <p class="fineprint" id="cfst-hint"></p>
+
+      <div class="grid2">
+        <div>
+          <label>本机 ID（房间号）</label>
+          <div class="field-row">
+            <input type="text" id="room-id" readonly />
+            <button type="button" class="btn" id="btn-copy-room">复制</button>
+          </div>
+        </div>
+        <div>
+          <label>本机密钥</label>
+          <div class="field-row">
+            <input type="text" id="secret" readonly />
+            <button type="button" class="btn" id="btn-copy-secret">复制</button>
+          </div>
+        </div>
+      </div>
+
+      <button type="button" class="btn primary wide" id="btn-refresh">
+        换一组 ID 和密钥
+      </button>
+      <p class="fineprint">
+        换完后若正在协助中，会自动重启本机程序以生效。
+      </p>
+
+      <div class="actions">
+        <button type="button" class="btn success" id="btn-start">开始协助</button>
+        <button type="button" class="btn danger" id="btn-stop">停止协助</button>
+      </div>
+    </main>
+
+    <section class="log" id="log"></section>
+
+    <div class="modal" id="modal-settings" hidden>
+      <div class="modal-backdrop" data-close="1"></div>
+      <div class="modal-panel">
+        <div class="modal-head">
+          <h2>设置</h2>
+          <button type="button" class="btn ghost" id="btn-close-settings">关闭</button>
+        </div>
+        <div class="modal-body">
+          <label class="inline">
+            <input type="checkbox" id="set-quick-tunnel" />
+            使用临时公网（trycloudflare，每次链接可能变化）
+          </label>
+          <p class="fineprint">
+            默认使用下方固定网址。固定域名需在 Cloudflare 隧道正常、本机协助服务已启动；Windows 可勾选「启动隧道服务」自动拉起 cloudflared。
+          </p>
+
+          <p class="fineprint clash-tip">
+            <strong>Clash Verge（关 VPN 也能上网）：</strong>打开 Clash Verge → 设置 →
+            <strong>关闭「TUN 模式」</strong>，并<strong>打开「系统代理」</strong>。不要再用任务管理器强杀，正常退出即可。
+          </p>
+
+          <label>控制端要打开的网址（固定模式用）</label>
+          <input type="url" id="set-control-url" />
+
+          <label>Python 程序路径（一般留空即可）</label>
+          <input type="text" id="set-python" spellcheck="false" />
+          <p class="fineprint" id="set-python-hint"></p>
+
+          <label>协助端代码文件夹（一般留空即可）</label>
+          <input type="text" id="set-workdir" spellcheck="false" />
+
+          <label>连接地址（一般不用改）</label>
+          <input type="text" id="set-relay" spellcheck="false" />
+
+          <div class="grid2">
+            <div>
+              <label>画面帧数 (fps)</label>
+              <input type="number" id="set-fps" min="1" max="20" />
+            </div>
+            <div>
+              <label>画面质量（最高 95）</label>
+              <input type="number" id="set-quality" min="1" max="95" />
+            </div>
+          </div>
+          <label>画面最大宽度（0=原分辨率；经公网建议 1280～1920 可明显降延迟）</label>
+          <input type="number" id="set-max-width" min="0" max="7680" step="10" />
+
+          <div id="win-tunnel-block">
+            <label class="inline">
+              <input type="checkbox" id="set-win-tunnel" />
+              开始时尝试启动 Windows 隧道服务
+            </label>
+            <label>隧道服务名称</label>
+            <input type="text" id="set-service-name" spellcheck="false" />
+          </div>
+
+          <p class="fineprint" id="mac-tunnel-note" hidden>
+            Mac 默认使用固定网址：请自行用 cloudflared 把域名指到本机 8765。若改用临时公网，安装包需自带 cloudflared（打 Mac 包前在 Mac 上执行 prepare-bundle）。
+          </p>
+
+          <button type="button" class="btn primary wide" id="btn-save-settings">保存设置</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>

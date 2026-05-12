@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Remote Assist</title>
+    <link rel="stylesheet" href="/static/styles.css?v=38" />
+  </head>
+  <body>
+    <main class="app">
+      <aside class="panel">
+        <div>
+          <p class="eyebrow">Remote Assist</p>
+          <h1 id="pageTitle">Remote Console</h1>
+        </div>
+
+        <form id="connectForm" class="connect">
+          <label>
+            <span id="roomLabel">Room</span>
+            <input id="room" autocomplete="off" required />
+          </label>
+          <label>
+            <span id="secretLabel">Secret</span>
+            <input id="secret" autocomplete="off" required type="password" />
+          </label>
+          <button id="connectButton" type="submit">Connect</button>
+        </form>
+
+        <div class="status">
+          <span id="dot" class="dot"></span>
+          <span id="statusText">Disconnected</span>
+        </div>
+
+        <div class="net-path" id="netPathBlock">
+          <div id="netPathLabel" class="net-path-title">Network</div>
+          <div class="net-path-radios">
+            <label class="inline"
+              ><input type="radio" name="netPath" id="netPathDirect" value="direct" checked />
+              <span id="netPathDirectLabel">Direct</span></label
+            >
+            <label class="inline"
+              ><input type="radio" name="netPath" id="netPathVpn" value="vpn" />
+              <span id="netPathVpnLabel">VPN on</span></label
+            >
+          </div>
+          <p class="hint net-path-hint" id="netPathHint"></p>
+        </div>
+
+        <div class="controls">
+          <label class="check utility-control">
+            <input id="enableInput" type="checkbox" checked />
+            <span id="enableInputLabel">Send mouse and keyboard</span>
+          </label>
+          <input id="textInput" class="utility-control" placeholder="Type text, press Enter to send" />
+          <textarea id="clipboardBox" class="utility-control" placeholder="Remote copied text appears here. Paste text here for remote paste."></textarea>
+          <div class="row">
+            <button id="sendCtrlAltDel" type="button">Ctrl+Alt+Del</button>
+            <button id="disconnect" type="button">Disconnect</button>
+          </div>
+          <div class="row">
+            <button id="smoothMode" type="button" class="secondary">Smooth mode</button>
+            <button id="clearMode" type="button" class="secondary">Clear mode</button>
+          </div>
+          <button id="inputModeToggle" type="button" class="secondary">中文</button>
+          <div class="row">
+            <button id="saveScreenshot" type="button" class="secondary utility-control">Save screenshot</button>
+            <button id="fullscreen" type="button" class="secondary">Fullscreen</button>
+          </div>
+        </div>
+
+        <section class="files">
+          <div class="section-title">
+            <span id="filesTitle">Files</span>
+            <button id="refreshFiles" type="button" class="tiny secondary">Refresh</button>
+          </div>
+          <p id="filesDescription" class="hint">Remote Desktop Files</p>
+          <input id="fileInput" class="utility-control" type="file" />
+          <button id="uploadFile" type="button" class="secondary utility-control">Upload to remote</button>
+          <p id="fileStatus" class="hint">Drop files on the remote screen to upload to Desktop.</p>
+          <div id="fileList" class="file-list"></div>
+        </section>
+      </aside>
+
+      <section class="viewer">
+        <div id="screenWrap" class="screen-wrap" tabindex="0">
+          <img id="screen" alt="remote screen" draggable="false" />
+          <div id="empty" class="empty">Waiting for the host screen</div>
+          <textarea id="imeInput" aria-label="remote input"></textarea>
+        </div>
+      </section>
+    </main>
+
+    <script src="/static/app.js?v=68"></script>
+  </body>
+</html>

@@ -1,0 +1,94 @@
+{
+  "name": "remote-assist-launcher",
+  "version": "1.0.0",
+  "description": "远程协助启动器（Windows / Mac）",
+  "main": "src/main.js",
+  "author": "",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "prepare-bundle": "node scripts/prepare-bundle.js",
+    "prepare-cfst": "node scripts/prepare-bundle.js --cfst-only",
+    "pack:nobundle": "electron-builder --dir",
+    "pack": "npm run prepare-bundle && electron-builder --dir",
+    "dist": "npm run prepare-bundle && electron-builder",
+    "dist:win": "npm run prepare-bundle && electron-builder --win",
+    "dist:mac": "npm run prepare-bundle && electron-builder --mac"
+  },
+  "devDependencies": {
+    "electron": "^31.7.7",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "asia.hemei.remoteassist.launcher",
+    "productName": "远程协助",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "src/**/*",
+      "renderer/**/*"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "extraResources": [
+        {
+          "from": "assist-bundle",
+          "to": "assist-bundle"
+        },
+        {
+          "from": "bundled-runtime/win/python-runtime",
+          "to": "python-runtime"
+        },
+        {
+          "from": "bundled-runtime/win/cloudflared.exe",
+          "to": "cloudflared.exe"
+        },
+        {
+          "from": "bundled-runtime/win/cfst",
+          "to": "cfst"
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "installerLanguages": [
+        "zh_CN",
+        "en_US"
+      ],
+      "language": "2052"
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "category": "public.app-category.utilities",
+      "extraResources": [
+        {
+          "from": "assist-bundle",
+          "to": "assist-bundle"
+        },
+        {
+          "from": "bundled-runtime/mac/python-runtime",
+          "to": "python-runtime"
+        },
+        {
+          "from": "bundled-runtime/mac/cloudflared",
+          "to": "cloudflared"
+        },
+        {
+          "from": "bundled-runtime/mac/cfst",
+          "to": "cfst"
+        }
+      ]
+    }
+  }
+}
