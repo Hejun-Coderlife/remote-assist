@@ -842,6 +842,39 @@ async function uploadFiles(files) {
   refreshFileList();
 }
 
+function clipboardFiles(event) {
+  const files = [];
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  for (const file of Array.from(event.clipboardData?.files || [])) {
+    if (file.name) files.push(file);
+  }
+  for (const item of Array.from(event.clipboardData?.items || [])) {
+    if (item.kind !== "file") continue;
+    const file = item.getAsFile();
+    if (!file) continue;
+    if (file.name) {
+      files.push(file);
+      continue;
+    }
+    const ext = file.type === "image/jpeg" ? "jpg" : file.type === "image/webp" ? "webp" : "png";
+    files.push(new File([file], `clipboard-${stamp}.${ext}`, { type: file.type || "image/png" }));
+  }
+  return files;
+}
+
+async function uploadClipboardFiles(event) {
+  const files = clipboardFiles(event);
+  if (!files.length) return false;
+  event.preventDefault();
+  event.stopPropagation();
+  try {
+    await uploadFiles(files);
+  } catch (error) {
+    fileStatus.textContent = `Upload failed: ${error.message}`;
+  }
+  return true;
+}
+
 function handleRemoteShortcut(event) {
   if (isLocalEditingTarget() || !enableInput.checked) return false;
 
@@ -1365,7 +1398,11 @@ imeInput.addEventListener("input", () => {
   imeInput.value = "";
 });
 
-imeInput.addEventListener("paste", (event) => {
+imeInput.addEventListener("paste", async (event) => {
+  if (await uploadClipboardFiles(event)) {
+    imeInput.value = "";
+    return;
+  }
   event.preventDefault();
   event.stopPropagation();
   const text = event.clipboardData?.getData("text/plain") || "";
@@ -1385,8 +1422,9 @@ document.addEventListener("cut", (event) => {
   sendControl({ kind: "cut" });
 });
 
-document.addEventListener("paste", (event) => {
+document.addEventListener("paste", async (event) => {
   if (isLocalEditingTarget() || !enableInput.checked) return;
+  if (await uploadClipboardFiles(event)) return;
   event.preventDefault();
   const text = event.clipboardData?.getData("text/plain") || clipboardBox.value || textInput.value;
   if (text) sendControl({ kind: "text", text });
@@ -1477,10 +1515,11 @@ uploadFile.addEventListener("click", async () => {
 
 refreshFiles.addEventListener("click", refreshFileList);
 
-for (const dropTarget of [document.body, screenWrap]) {
+for (const dropTarget of [document.body, screenWrap, screenImg, webrtcVideo]) {
   dropTarget.addEventListener("dragover", (event) => {
     if (!event.dataTransfer?.types.includes("Files")) return;
     event.preventDefault();
+    event.stopPropagation();
     screenWrap.classList.add("drag-over");
     fileStatus.textContent = "Release to upload to the remote Desktop.";
   });
@@ -1493,6 +1532,7 @@ for (const dropTarget of [document.body, screenWrap]) {
   dropTarget.addEventListener("drop", async (event) => {
     if (!event.dataTransfer?.files?.length) return;
     event.preventDefault();
+    event.stopPropagation();
     screenWrap.classList.remove("drag-over");
     try {
       await uploadFiles(event.dataTransfer.files);

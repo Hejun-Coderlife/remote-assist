@@ -22,7 +22,8 @@ def get_files_dir() -> Path:
     env = os.environ.get("REMOTE_ASSIST_FILES_DIR", "").strip()
     if env:
         return Path(env)
-    return Path.home() / "RemoteAssistFiles"
+    desktop = Path.home() / "Desktop"
+    return desktop if desktop.exists() else Path.home() / "RemoteAssistFiles"
 
 app = FastAPI(title="Remote Assist Relay")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
