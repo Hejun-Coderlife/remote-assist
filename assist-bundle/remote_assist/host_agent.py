@@ -21,12 +21,22 @@ import websockets
 from PIL import Image, ImageChops
 
 try:
-    from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
+    from aiortc import (
+        RTCConfiguration,
+        RTCIceServer,
+        RTCPeerConnection,
+        RTCRtpSender,
+        RTCSessionDescription,
+        VideoStreamTrack,
+    )
     from av import VideoFrame
 
     WEBRTC_AVAILABLE = True
 except Exception:
+    RTCConfiguration = None
+    RTCIceServer = None
     RTCPeerConnection = None
+    RTCRtpSender = None
     RTCSessionDescription = None
     VideoFrame = None
     VideoStreamTrack = object
@@ -417,6 +427,42 @@ class ScreenVideoTrack(VideoStreamTrack):
         return frame
 
 
+def build_webrtc_config(args: argparse.Namespace):
+    stun_urls = [url.strip() for url in args.stun.split(",") if url.strip()]
+    if not stun_urls:
+        return None
+    return RTCConfiguration(iceServers=[RTCIceServer(urls=stun_urls)])
+
+
+def prefer_h264(pc) -> None:
+    if RTCRtpSender is None:
+        return
+    capabilities = RTCRtpSender.getCapabilities("video")
+    h264 = [codec for codec in capabilities.codecs if codec.mimeType.lower() == "video/h264"]
+    rest = [codec for codec in capabilities.codecs if codec.mimeType.lower() != "video/h264"]
+    if not h264:
+        return
+    for transceiver in pc.getTransceivers():
+        if transceiver.kind == "video":
+            transceiver.setCodecPreferences(h264 + rest)
+
+
+async def wait_for_ice_gathering(pc, timeout: float = 1.5) -> None:
+    if pc.iceGatheringState == "complete":
+        return
+    done = asyncio.Event()
+
+    @pc.on("icegatheringstatechange")
+    def on_ice_gathering_state_change():
+        if pc.iceGatheringState == "complete":
+            done.set()
+
+    try:
+        await asyncio.wait_for(done.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        pass
+
+
 async def run_webrtc_host(args: argparse.Namespace, room: str, secret: str, shared: SharedState) -> None:
     if not WEBRTC_AVAILABLE:
         print("WebRTC video disabled: install aiortc in the bundled Python runtime.", file=sys.stderr)
@@ -424,7 +470,7 @@ async def run_webrtc_host(args: argparse.Namespace, room: str, secret: str, shar
 
     url = f"{args.relay.rstrip('/')}/ws/webrtc_host/{quote(room)}?secret={quote(secret)}"
     while True:
-        pc = RTCPeerConnection()
+        pc = RTCPeerConnection(build_webrtc_config(args))
         try:
             async with websockets.connect(
                 url,
@@ -435,13 +481,16 @@ async def run_webrtc_host(args: argparse.Namespace, room: str, secret: str, shar
                 ping_timeout=60,
             ) as ws:
                 pc.addTrack(ScreenVideoTrack(args.monitor, shared))
+                prefer_h264(pc)
                 offer = await pc.createOffer()
                 await pc.setLocalDescription(offer)
+                await wait_for_ice_gathering(pc)
                 await ws.send(
                     json.dumps(
                         {
                             "type": pc.localDescription.type,
                             "sdp": pc.localDescription.sdp,
+                            "codec": "h264-preferred",
                         }
                     )
                 )
@@ -544,6 +593,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--monitor", type=int, default=1, help="mss monitor index")
     parser.add_argument("--no-keyboard", action="store_true", help="disable remote keyboard input")
     parser.add_argument("--webrtc", choices=("auto", "off"), default="auto", help="enable optional WebRTC video when aiortc is installed")
+    parser.add_argument(
+        "--stun",
+        default="stun:stun.l.google.com:19302,stun:global.stun.twilio.com:3478",
+        help="comma-separated STUN server URLs for WebRTC",
+    )
     return parser.parse_args()
 
 

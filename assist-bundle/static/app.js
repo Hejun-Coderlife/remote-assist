@@ -37,6 +37,11 @@ let controlSocket = null;
 let webrtcSocket = null;
 let peerConnection = null;
 let webrtcActive = false;
+let webrtcReconnectTimer = null;
+let webrtcRoom = "";
+let webrtcSecret = "";
+let pendingMoveEvent = null;
+let moveFlushScheduled = false;
 let lastMouseMove = 0;
 let lastMouseClientX = null;
 let lastMouseClientY = null;
@@ -408,8 +413,25 @@ function setJpegFallbackEnabled(enabled) {
   sendControlRaw({ kind: "jpeg_stream", enabled });
 }
 
-function closeWebRtc() {
+function clearWebRtcReconnect() {
+  if (webrtcReconnectTimer) {
+    clearTimeout(webrtcReconnectTimer);
+    webrtcReconnectTimer = null;
+  }
+}
+
+function scheduleWebRtcReconnect() {
+  if (!webrtcRoom || !webrtcSecret || webrtcReconnectTimer) return;
+  if (controlSocket?.readyState !== WebSocket.OPEN) return;
+  webrtcReconnectTimer = setTimeout(() => {
+    webrtcReconnectTimer = null;
+    startWebRtc(webrtcRoom, webrtcSecret);
+  }, 1800);
+}
+
+function closeWebRtc({ reconnect = false } = {}) {
   webrtcActive = false;
+  if (!reconnect) clearWebRtcReconnect();
   if (webrtcSocket) {
     webrtcSocket.close();
     webrtcSocket = null;
@@ -425,6 +447,7 @@ function closeWebRtc() {
   webrtcVideo.style.display = "none";
   if (screenImg.width && screenImg.height) screenImg.style.display = "block";
   setJpegFallbackEnabled(true);
+  if (reconnect) scheduleWebRtcReconnect();
 }
 
 function waitForIceGathering(pc) {
@@ -441,8 +464,12 @@ function waitForIceGathering(pc) {
 }
 
 function startWebRtc(room, secret) {
+  webrtcRoom = room;
+  webrtcSecret = secret;
+  clearWebRtcReconnect();
   closeWebRtc();
   if (!("RTCPeerConnection" in window)) return;
+  setStatus("WebRTC signaling...", true);
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
   const url = `${protocol}//${location.host}/ws/webrtc_controller/${encodeURIComponent(room)}?secret=${encodeURIComponent(secret)}`;
   webrtcSocket = new WebSocket(url);
@@ -451,14 +478,19 @@ function startWebRtc(room, secret) {
     const payload = JSON.parse(event.data);
     if (payload.type === "offer") {
       if (peerConnection) peerConnection.close();
-      const pc = new RTCPeerConnection({ iceServers: [] });
+      const pc = new RTCPeerConnection({
+        iceServers: [
+          { urls: "stun:stun.l.google.com:19302" },
+          { urls: "stun:global.stun.twilio.com:3478" },
+        ],
+      });
       peerConnection = pc;
       pc.addEventListener("track", (trackEvent) => {
         webrtcVideo.srcObject = trackEvent.streams[0] || new MediaStream([trackEvent.track]);
       });
       pc.addEventListener("connectionstatechange", () => {
         if (["failed", "closed", "disconnected"].includes(pc.connectionState)) {
-          closeWebRtc();
+          closeWebRtc({ reconnect: true });
         }
       });
       await pc.setRemoteDescription({ type: "offer", sdp: payload.sdp });
@@ -473,10 +505,15 @@ function startWebRtc(room, secret) {
           }),
         );
       }
+      setStatus(`WebRTC answer sent (${payload.codec || "auto codec"})`, true);
     }
   });
   webrtcSocket.addEventListener("close", () => {
-    if (webrtcActive) closeWebRtc();
+    if (webrtcActive || peerConnection) closeWebRtc({ reconnect: true });
+  });
+  webrtcSocket.addEventListener("error", () => {
+    setStatus("WebRTC signaling failed; using JPEG fallback", false);
+    closeWebRtc({ reconnect: true });
   });
 }
 
@@ -1042,8 +1079,26 @@ async function pasteLocalClipboard() {
   }
 }
 
-function sendControl(event) {
+function sendControl(event, immediate = false) {
   if (!enableInput.checked) return;
+  if (event.kind === "move" && !immediate) {
+    pendingMoveEvent = event;
+    if (!moveFlushScheduled) {
+      moveFlushScheduled = true;
+      requestAnimationFrame(() => {
+        moveFlushScheduled = false;
+        const move = pendingMoveEvent;
+        pendingMoveEvent = null;
+        if (move) sendControl(move, true);
+      });
+    }
+    return;
+  }
+  if (pendingMoveEvent) {
+    const move = pendingMoveEvent;
+    pendingMoveEvent = null;
+    sendControl(move, true);
+  }
   const target = controlSocket?.readyState === WebSocket.OPEN ? controlSocket : socket;
   if (!target || target.readyState !== WebSocket.OPEN) return;
   if (adaptiveSmoothEnabled) {
