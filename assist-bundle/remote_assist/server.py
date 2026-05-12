@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import tempfile
 import zipfile
 from dataclasses import dataclass, field
@@ -58,11 +59,33 @@ async def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
 
 
-def safe_file_path(name: str) -> Path:
+def clean_file_name(name: str) -> str:
     clean_name = Path(name).name.strip()
+    clean_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", clean_name)
+    clean_name = re.sub(r"\s+", " ", clean_name).strip(" .")
     if not clean_name or clean_name in {".", ".."}:
         raise HTTPException(status_code=400, detail="invalid file name")
+    stem = Path(clean_name).stem[:96].strip(" .") or "file"
+    suffix = Path(clean_name).suffix[:16]
+    return f"{stem}{suffix}"
+
+
+def safe_file_path(name: str) -> Path:
+    clean_name = clean_file_name(name)
     return get_files_dir() / clean_name
+
+
+def unique_file_path(name: str) -> Path:
+    target = safe_file_path(name)
+    if not target.exists():
+        return target
+    stem = target.stem
+    suffix = target.suffix
+    for index in range(1, 1000):
+        candidate = target.with_name(f"{stem}-{index}{suffix}")
+        if not candidate.exists():
+            return candidate
+    raise HTTPException(status_code=409, detail="too many files with the same name")
 
 
 @app.get("/api/files")
@@ -88,7 +111,7 @@ async def list_files() -> dict[str, Any]:
 @app.post("/api/files")
 async def upload_file(request: Request, name: str = Query(min_length=1)) -> dict[str, Any]:
     get_files_dir().mkdir(parents=True, exist_ok=True)
-    target = safe_file_path(name)
+    target = unique_file_path(name)
     body = await request.body()
     if len(body) > 300 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="file is too large")

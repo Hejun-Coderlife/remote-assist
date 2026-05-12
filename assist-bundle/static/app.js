@@ -189,6 +189,7 @@ function applyInteractiveProfileForControl() {
 }
 
 const networkPathKey = "remoteAssistNetPath";
+const experimentalWebRtcKey = "remoteAssistExperimentalWebRtc";
 
 /** 直连：与 VPN 使用同一套清晰度/延迟平衡档位，避免两种路径体验不一致 */
 const adaptiveSmoothProfilesDirect = [
@@ -468,6 +469,7 @@ function startWebRtc(room, secret) {
   webrtcSecret = secret;
   clearWebRtcReconnect();
   closeWebRtc();
+  if (localStorage.getItem(experimentalWebRtcKey) !== "1") return;
   if (!("RTCPeerConnection" in window)) return;
   setStatus("WebRTC signaling...", true);
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
@@ -827,19 +829,43 @@ async function uploadFiles(files) {
 
   let uploaded = 0;
   for (const file of queue) {
-    fileStatus.textContent = `Uploading ${file.name} (${uploaded + 1}/${queue.length})...`;
-    const response = await fetch(`/api/files?name=${encodeURIComponent(file.name)}`, {
+    const uploadName = uploadFileName(file, uploaded);
+    fileStatus.textContent = `Uploading ${uploadName} (${uploaded + 1}/${queue.length})...`;
+    const response = await fetch(`/api/files?name=${encodeURIComponent(uploadName)}`, {
       method: "POST",
       headers: { "content-type": "application/octet-stream" },
       body: await file.arrayBuffer(),
     });
-    if (!response.ok) throw new Error(`${file.name}: HTTP ${response.status}`);
+    if (!response.ok) throw new Error(`${uploadName}: HTTP ${response.status}`);
     uploaded += 1;
   }
 
   fileInput.value = "";
   fileStatus.textContent = `Uploaded ${uploaded} file${uploaded === 1 ? "" : "s"} to Desktop.`;
   refreshFileList();
+}
+
+function fileExtension(file) {
+  const fromName = (file.name || "").split(".").pop();
+  if (fromName && fromName !== file.name && fromName.length <= 8) return fromName.toLowerCase();
+  if (file.type === "image/jpeg") return "jpg";
+  if (file.type === "image/webp") return "webp";
+  if (file.type === "image/gif") return "gif";
+  if (file.type === "image/png") return "png";
+  return "bin";
+}
+
+function isGeneratedImageName(name) {
+  return /(_cgi-bin|webwxgetmsgimg|msgid=|skey=|wx_webfilehelper|clipboard)/i.test(name || "");
+}
+
+function uploadFileName(file, index = 0) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const ext = fileExtension(file);
+  if ((file.type || "").startsWith("image/") && isGeneratedImageName(file.name)) {
+    return `image-${stamp}${index ? `-${index + 1}` : ""}.${ext}`;
+  }
+  return file.name || `file-${stamp}${index ? `-${index + 1}` : ""}.${ext}`;
 }
 
 function clipboardFiles(event) {
@@ -852,7 +878,7 @@ function clipboardFiles(event) {
     if (item.kind !== "file") continue;
     const file = item.getAsFile();
     if (!file) continue;
-    if (file.name) {
+    if (file.name && !isGeneratedImageName(file.name)) {
       files.push(file);
       continue;
     }

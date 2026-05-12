@@ -592,7 +592,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--monitor", type=int, default=1, help="mss monitor index")
     parser.add_argument("--no-keyboard", action="store_true", help="disable remote keyboard input")
-    parser.add_argument("--webrtc", choices=("auto", "off"), default="auto", help="enable optional WebRTC video when aiortc is installed")
+    parser.add_argument("--webrtc", choices=("auto", "off"), default="off", help="enable optional WebRTC video when aiortc is installed")
     parser.add_argument(
         "--stun",
         default="stun:stun.l.google.com:19302,stun:global.stun.twilio.com:3478",
