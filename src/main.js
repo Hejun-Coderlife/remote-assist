@@ -15,11 +15,13 @@ let tunnelBuffer = '';
 let sessionControlUrl = '';
 
 const TRY_CLOUDFLARE_RE = /https:\/\/[a-zA-Z0-9.-]+\.trycloudflare\.com\/?/i;
+const DEFAULT_ROOM_ID = 'AZUYk9sNMfhK';
+const DEFAULT_SECRET = 'qMpQ3NMr4CUSsuPa';
 
 const defaultSettings = () => ({
   controlUrl: 'https://remote.hemei.asia/',
-  roomId: '',
-  secret: '',
+  roomId: DEFAULT_ROOM_ID,
+  secret: DEFAULT_SECRET,
   pythonPath: '',
   workDir: '',
   relayUrl: 'ws://127.0.0.1:8765',
@@ -484,11 +486,11 @@ function randomReadable(len) {
 function ensureCredentials(settings) {
   let changed = false;
   if (!settings.roomId || settings.roomId.length < 4) {
-    settings.roomId = randomReadable(12);
+    settings.roomId = DEFAULT_ROOM_ID;
     changed = true;
   }
   if (!settings.secret || settings.secret.length < 4) {
-    settings.secret = randomReadable(16);
+    settings.secret = DEFAULT_SECRET;
     changed = true;
   }
   return changed;
@@ -611,6 +613,37 @@ function killProc(proc, label) {
   if (label) sendStatus({ level: 'info', text: `已结束：${label}` });
 }
 
+function killExternalRemoteAssistProcesses(pythonPath) {
+  return new Promise((resolve) => {
+    if (process.platform !== 'win32') {
+      resolve(0);
+      return;
+    }
+    const safePython = String(pythonPath || '').replace(/'/g, "''").toLowerCase();
+    const ps = `
+$ErrorActionPreference = 'SilentlyContinue'
+$pythonPath = '${safePython}'
+$matches = @(Get-CimInstance Win32_Process -Filter "name='python.exe'" | Where-Object {
+  $_.CommandLine -match 'remote_assist\\.(server|host_agent)' -and
+  ([string]::IsNullOrWhiteSpace($pythonPath) -or $_.CommandLine.ToLowerInvariant().Contains($pythonPath))
+})
+foreach ($p in $matches) {
+  try { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue } catch {}
+}
+$matches.Count
+`;
+    execFile(
+      'powershell.exe',
+      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps],
+      { windowsHide: true, timeout: 12000, maxBuffer: 1024 * 1024 },
+      (_err, stdout) => {
+        const count = Number(String(stdout || '').trim());
+        resolve(Number.isFinite(count) ? count : 0);
+      }
+    );
+  });
+}
+
 function tryExtractTrycloudflareUrl(text) {
   const m = text.match(TRY_CLOUDFLARE_RE);
   if (!m) return null;
@@ -670,6 +703,8 @@ function spawnPython(pythonPath, args, cwd, extraEnv) {
 }
 
 async function stopAssistInternal() {
+  const s = loadSettings();
+  const pythonPath = resolvePythonPath(s);
   assistRunning = false;
   sessionControlUrl = '';
   sendControlUrl('', false);
@@ -679,6 +714,8 @@ async function stopAssistInternal() {
   tunnelProc = null;
   killProc(serverProc, '本机服务程序');
   serverProc = null;
+  const cleaned = await killExternalRemoteAssistProcesses(pythonPath);
+  if (cleaned) sendStatus({ level: 'info', text: `已清理后台协助进程：${cleaned} 个` });
   notifyAssistReset();
 }
 
@@ -712,18 +749,25 @@ async function startAssistInternal() {
     return true;
   }
 
-  const portInUse = await checkHttpOk(s.localCheckUrl);
+  let portInUse = await checkHttpOk(s.localCheckUrl);
+  if (portInUse) {
+    sendStatus({ level: 'warn', text: '检测到已有本机协助服务，正在先清理后台进程…' });
+    const cleaned = await killExternalRemoteAssistProcesses(pythonPath);
+    if (cleaned) {
+      sendStatus({ level: 'info', text: `已清理后台协助进程：${cleaned} 个` });
+      await new Promise((r) => setTimeout(r, 1500));
+      portInUse = await checkHttpOk(s.localCheckUrl);
+    }
+  }
   if (portInUse) {
     sendStatus({
       level: 'error',
-      text: '本机 8765 端口已被占用（常见：上次协助未正常退出、或其它程序占用）。请先点「停止协助」，或在任务管理器里结束残留的 python.exe 后再试。'
+      text: '本机 8765 端口仍被占用（可能是其它程序占用）。请在任务管理器里结束占用 8765 的程序后再试。'
     });
     return false;
   }
 
-  const filesDir = path.join(app.getPath('userData'), 'RemoteAssistFiles');
-  fs.mkdirSync(filesDir, { recursive: true });
-  const childEnv = { REMOTE_ASSIST_FILES_DIR: filesDir };
+  const childEnv = {};
 
   const useQuick = !!s.useQuickTunnel;
   const cfPath = bundledCloudflaredPath();
@@ -934,12 +978,15 @@ function createWindow() {
     minWidth: 440,
     minHeight: 620,
     show: false,
+    autoHideMenuBar: true,
+    backgroundColor: '#f5f5f7',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false
     }
   });
+  mainWindow.setMenuBarVisibility(false);
   mainWindow.once('ready-to-show', () => mainWindow.show());
   mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
 }

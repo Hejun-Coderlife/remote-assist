@@ -98,6 +98,7 @@ class SharedState:
     settings: StreamSettings
     screen: ScreenState | None = None
     jpeg_enabled: bool = True
+    force_full_frames: int = 2
     client_extra_lag_ms: float = 0.0
     client_decode_ms: float = 0.0
     client_dropped_frames: int = 0
@@ -197,6 +198,9 @@ def pack_frame(
 
 
 def effective_stream_settings(settings: StreamSettings, shared: SharedState) -> StreamSettings:
+    if settings.quality >= 95 and settings.max_width == 0 and settings.jpeg_subsampling == 0:
+        return settings
+
     age = time.monotonic() - shared.last_feedback_at
     if age > 1.5:
         return settings
@@ -239,6 +243,8 @@ def scale_point(state: ScreenState, x: float, y: float) -> tuple[int, int]:
 
 def normalize_key(key: object) -> str:
     value = str(key or "").lower()
+    if value in {"command", "cmd"}:
+        return "command" if _IS_MAC else "ctrl"
     return KEY_ALIASES.get(value, value)
 
 
@@ -311,6 +317,7 @@ async def sender(ws, monitor_index: int, shared: SharedState) -> None:
                 previous_image is None
                 or mode_signature != last_mode_signature
                 or started - last_full_frame_at > 2.5
+                or shared.force_full_frames > 0
             )
             encoded, previous_image = encode_frame(
                 sct,
@@ -327,6 +334,8 @@ async def sender(ws, monitor_index: int, shared: SharedState) -> None:
                 shared.screen = encoded.state
                 if encoded.full:
                     last_full_frame_at = started
+                    if shared.force_full_frames > 0:
+                        shared.force_full_frames -= 1
 
             if started - last_status > 3:
                 await ws.send(
@@ -360,13 +369,24 @@ async def receiver(ws, allow_keyboard: bool, shared: SharedState) -> None:
                 js = event.get("jpegSubsampling", event.get("jpeg_subsampling"))
                 if js is not None:
                     shared.settings.jpeg_subsampling = 0 if int(js) == 0 else 2
+                shared.force_full_frames = max(shared.force_full_frames, 2)
             elif event.get("kind") == "jpeg_stream":
                 shared.jpeg_enabled = bool(event.get("enabled", True))
+                if shared.jpeg_enabled:
+                    shared.force_full_frames = max(shared.force_full_frames, 2)
+            elif event.get("kind") == "request_full_frame":
+                shared.force_full_frames = max(shared.force_full_frames, 2)
             elif event.get("kind") == "stream_feedback":
                 shared.client_extra_lag_ms = float(event.get("extraLagMs", 0) or 0)
                 shared.client_decode_ms = float(event.get("decodeMs", 0) or 0)
                 shared.client_dropped_frames = int(event.get("droppedFrames", 0) or 0)
                 shared.last_feedback_at = time.monotonic()
+            elif event.get("kind") == "read_clipboard" and allow_keyboard:
+                try:
+                    text = pyperclip.paste()
+                except Exception:
+                    text = ""
+                await ws.send(json.dumps({"type": "clipboard_status", "text": text}))
             elif event.get("kind") in {"copy", "cut"} and allow_keyboard:
                 before = ""
                 try:

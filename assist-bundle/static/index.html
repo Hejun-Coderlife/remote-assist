@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Remote Assist</title>
-    <link rel="stylesheet" href="/static/styles.css?v=39" />
+    <link rel="stylesheet" href="/static/styles.css?v=44" />
   </head>
   <body>
     <main class="app">
@@ -61,10 +61,10 @@
             <button id="smoothMode" type="button" class="secondary">Smooth mode</button>
             <button id="clearMode" type="button" class="secondary">Clear mode</button>
           </div>
-          <button id="inputModeToggle" type="button" class="secondary">中文</button>
+          <button id="fullscreen" type="button" class="secondary">Fullscreen</button>
           <div class="row">
             <button id="saveScreenshot" type="button" class="secondary utility-control">Save screenshot</button>
-            <button id="fullscreen" type="button" class="secondary">Fullscreen</button>
+            <button id="inputModeToggle" type="button" class="secondary">中文</button>
           </div>
         </div>
 
@@ -86,11 +86,12 @@
           <video id="webrtcVideo" aria-label="remote video stream" autoplay playsinline muted></video>
           <canvas id="screen" aria-label="remote screen"></canvas>
           <div id="empty" class="empty">Waiting for the host screen</div>
+          <div id="uploadOverlay" class="upload-overlay" hidden></div>
           <textarea id="imeInput" aria-label="remote input"></textarea>
         </div>
       </section>
     </main>
 
-    <script src="/static/app.js?v=75"></script>
+    <script src="/static/app.js?v=88"></script>
   </body>
 </html>

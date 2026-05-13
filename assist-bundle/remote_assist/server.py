@@ -48,6 +48,7 @@ class Room:
     webrtc_controllers: set[WebSocket] = field(default_factory=set)
     controllers: set[WebSocket] = field(default_factory=set)
     last_frame: bytes | None = None
+    last_full_frame: bytes | None = None
 
 
 rooms: dict[str, Room] = {}
@@ -88,6 +89,15 @@ def unique_file_path(name: str) -> Path:
     raise HTTPException(status_code=409, detail="too many files with the same name")
 
 
+def upload_temp_path(upload_id: str) -> Path:
+    clean_id = re.sub(r"[^A-Za-z0-9_.-]", "_", upload_id).strip("._")
+    if not clean_id or len(clean_id) > 120:
+        raise HTTPException(status_code=400, detail="invalid upload id")
+    base = Path(tempfile.gettempdir()) / "remote-assist-uploads"
+    base.mkdir(parents=True, exist_ok=True)
+    return base / f"{clean_id}.part"
+
+
 @app.get("/api/files")
 async def list_files() -> dict[str, Any]:
     base = get_files_dir()
@@ -117,6 +127,35 @@ async def upload_file(request: Request, name: str = Query(min_length=1)) -> dict
         raise HTTPException(status_code=413, detail="file is too large")
     target.write_bytes(body)
     return {"ok": True, "name": target.name, "size": len(body)}
+
+
+@app.post("/api/files/chunk")
+async def upload_file_chunk(
+    request: Request,
+    name: str = Query(min_length=1),
+    upload_id: str = Query(min_length=8),
+    index: int = Query(ge=0),
+    total: int = Query(ge=1, le=10000),
+) -> dict[str, Any]:
+    if index >= total:
+        raise HTTPException(status_code=400, detail="chunk index out of range")
+
+    body = await request.body()
+    if len(body) > 16 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="chunk is too large")
+
+    temp_path = upload_temp_path(upload_id)
+    mode = "wb" if index == 0 else "ab"
+    with temp_path.open(mode) as handle:
+        handle.write(body)
+
+    if index < total - 1:
+        return {"ok": True, "complete": False, "received": index + 1}
+
+    get_files_dir().mkdir(parents=True, exist_ok=True)
+    target = unique_file_path(name)
+    temp_path.replace(target)
+    return {"ok": True, "complete": True, "name": target.name, "size": target.stat().st_size}
 
 
 @app.get("/api/files/{name}")
@@ -195,6 +234,19 @@ async def broadcast_webrtc(room: Room, payload: dict[str, Any]) -> None:
         room.webrtc_controllers.discard(controller)
 
 
+def frame_is_full(frame: bytes) -> bool:
+    try:
+        if len(frame) < 4:
+            return False
+        header_len = int.from_bytes(frame[:4], "big")
+        if header_len <= 0 or header_len > len(frame) - 4:
+            return False
+        header = json.loads(frame[4 : 4 + header_len].decode("utf-8"))
+        return header.get("full") is not False
+    except Exception:
+        return False
+
+
 @app.websocket("/ws/host/{room_id}")
 async def host_socket(
     websocket: WebSocket,
@@ -234,6 +286,8 @@ async def host_socket(
 
     def enqueue_frame(frame: bytes) -> None:
         room.last_frame = frame
+        if frame_is_full(frame):
+            room.last_full_frame = frame
         try:
             frame_q.put_nowait(frame)
         except asyncio.QueueFull:
@@ -297,7 +351,7 @@ async def host_control_socket(
         while True:
             message = await websocket.receive_text()
             payload = json.loads(message)
-            if payload.get("type") == "clipboard":
+            if payload.get("type") in {"clipboard", "clipboard_status"}:
                 await broadcast_json(room, payload)
     except (WebSocketDisconnect, json.JSONDecodeError, RuntimeError):
         pass
@@ -363,7 +417,7 @@ async def controller_socket(
             return
         room.controllers.add(websocket)
         host = room.host
-        last_frame = room.last_frame
+        last_frame = room.last_full_frame
 
     await send_json_safe(websocket, {"type": "host_status", "online": host is not None})
     if last_frame:

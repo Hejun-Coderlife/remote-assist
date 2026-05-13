@@ -19,6 +19,7 @@ const sendCtrlAltDel = document.querySelector("#sendCtrlAltDel");
 const fullscreenButton = document.querySelector("#fullscreen");
 const screenWrap = document.querySelector("#screenWrap");
 const imeInput = document.querySelector("#imeInput");
+const uploadOverlay = document.querySelector("#uploadOverlay");
 const smoothMode = document.querySelector("#smoothMode");
 const clearMode = document.querySelector("#clearMode");
 const inputModeToggle = document.querySelector("#inputModeToggle");
@@ -52,6 +53,11 @@ let latestFrameBlob = null;
 let pendingFrameDrops = 0;
 let lastStreamFeedbackAt = 0;
 let lastReceiveGapMs = 0;
+let pasteFallbackTimer = null;
+let clipboardProbeTimer = null;
+let lastRemoteClipboardText = "";
+let hasBaseFrame = false;
+let lastFullFrameRequestAt = 0;
 let composing = false;
 let lastCompositionAt = 0;
 let currentStreamMode = {
@@ -68,6 +74,11 @@ let lastAdaptiveAdjustAt = 0;
 const frameIntervalsMs = [];
 let lastFrameHostTimestamp = 0;
 let lastVpnLagDowngradeAt = 0;
+const uploadTimeoutMs = 60 * 1000;
+const recentUploadedFiles = new Set();
+let uploadOverlayTimer = null;
+let remoteTextBuffer = "";
+let remoteTextFlushTimer = null;
 /** 控制器侧相邻两帧到达间隔（VPN 下用于发现「主机仍规律发包但链路积压」） */
 const vpnReceiveGapsMs = [];
 let lastClientFrameAtForVpn = 0;
@@ -381,6 +392,7 @@ function adaptiveSmoothVpnLagGuard(hostTimestampSec) {
 
 function sendStreamFeedback({ header, decodeMs, paintMs, droppedFrames, receiveGapMs }) {
   if (!adaptiveSmoothEnabled || typeof header.timestamp !== "number") return;
+  if (idleBoostStage === "full") return;
   const now = performance.now();
   const severe = lastHostLagExtraSec * 1000 > 220 || decodeMs > 80 || droppedFrames > 0;
   if (!severe && now - lastStreamFeedbackAt < 650) return;
@@ -408,6 +420,13 @@ function sendControlRaw(event) {
   if (target?.readyState === WebSocket.OPEN) {
     target.send(JSON.stringify({ type: "control", event }));
   }
+}
+
+function requestFullFrame(force = false) {
+  const now = performance.now();
+  if (!force && now - lastFullFrameRequestAt < 500) return;
+  lastFullFrameRequestAt = now;
+  sendControlRaw({ kind: "request_full_frame" });
 }
 
 function setJpegFallbackEnabled(enabled) {
@@ -688,6 +707,14 @@ function focusRemoteInput() {
   }
 }
 
+function positionImeInputFromPointer(event) {
+  const rect = screenWrap.getBoundingClientRect();
+  const x = Math.max(0, Math.min(rect.width - 2, event.clientX - rect.left));
+  const y = Math.max(0, Math.min(rect.height - 24, event.clientY - rect.top));
+  imeInput.style.setProperty("--ime-left", `${x}px`);
+  imeInput.style.setProperty("--ime-top", `${y}px`);
+}
+
 function isLocalEditingTarget() {
   return (
     document.activeElement === textInput ||
@@ -723,6 +750,36 @@ function shouldKeepKeyLocal(event) {
   ]);
   const recentIme = performance.now() - lastCompositionAt < 800;
   return imeKeys.has(event.key) && (isImeComposing(event) || recentIme || imeInput.value.length > 0);
+}
+
+function isPlainPrintableKey(event) {
+  return (
+    event.key?.length === 1 &&
+    !event.ctrlKey &&
+    !event.metaKey &&
+    !event.altKey &&
+    !isImeComposing(event)
+  );
+}
+
+function flushRemoteTextBuffer() {
+  if (remoteTextFlushTimer) {
+    clearTimeout(remoteTextFlushTimer);
+    remoteTextFlushTimer = null;
+  }
+  const text = remoteTextBuffer;
+  remoteTextBuffer = "";
+  if (text) sendControl({ kind: "text", text });
+}
+
+function queueRemoteText(text) {
+  remoteTextBuffer += text;
+  if (remoteTextBuffer.length >= 24 || /[\s.,;:!?，。；：！？]$/.test(remoteTextBuffer)) {
+    flushRemoteTextBuffer();
+    return;
+  }
+  if (remoteTextFlushTimer) clearTimeout(remoteTextFlushTimer);
+  remoteTextFlushTimer = setTimeout(flushRemoteTextBuffer, 60);
 }
 
 function isLocalInputSwitchShortcut(event) {
@@ -767,16 +824,87 @@ function downloadBlob(blob, name) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-async function refreshFileList() {
-  fileStatus.textContent = "Loading files...";
+function uploadedFileMessage(names) {
+  if (!names.length) return "Uploaded to Desktop";
+  if (names.length === 1) return `Uploaded ${names[0]} to Desktop`;
+  return `Uploaded ${names.length} files to Desktop`;
+}
+
+function setUploadStatus(message, state = "active") {
+  fileStatus.textContent = message;
+  if (!uploadOverlay) return;
+  uploadOverlay.textContent = message;
+  uploadOverlay.hidden = false;
+  uploadOverlay.classList.toggle("upload-overlay-success", state === "success");
+  uploadOverlay.classList.toggle("upload-overlay-error", state === "error");
+  if (uploadOverlayTimer) {
+    clearTimeout(uploadOverlayTimer);
+    uploadOverlayTimer = null;
+  }
+  if (state !== "active") {
+    uploadOverlayTimer = setTimeout(() => {
+      uploadOverlay.hidden = true;
+      uploadOverlayTimer = null;
+    }, state === "success" ? 4500 : 9000);
+  }
+}
+
+function xhrUpload(url, body, label, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", url);
+    xhr.timeout = uploadTimeoutMs;
+    xhr.setRequestHeader("content-type", "application/octet-stream");
+
+    xhr.upload.addEventListener("progress", (event) => {
+      if (!event.lengthComputable || typeof onProgress !== "function") return;
+      onProgress(event.loaded, event.total);
+    });
+
+    xhr.addEventListener("load", () => {
+      resolve({
+        ok: xhr.status >= 200 && xhr.status < 300,
+        status: xhr.status,
+        text: async () => xhr.responseText || "",
+        json: async () => (xhr.responseText ? JSON.parse(xhr.responseText) : null),
+      });
+    });
+    xhr.addEventListener("timeout", () => {
+      reject(new Error(`${label}: upload timed out. Refresh or drop the file again.`));
+    });
+    xhr.addEventListener("error", () => {
+      reject(new Error(`${label}: network error during upload.`));
+    });
+    xhr.addEventListener("abort", () => {
+      reject(new Error(`${label}: upload was aborted.`));
+    });
+
+    xhr.send(body);
+  });
+}
+
+async function refreshFileList(options = {}) {
+  const highlightNames = new Set(options.highlightNames || []);
+  const pinNames = new Set(options.pinNames || []);
+  if (!options.keepStatus) fileStatus.textContent = "Loading files...";
   try {
     const response = await fetch("/api/files", { cache: "no-store" });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const payload = await response.json();
-    fileStatus.textContent = `${tr("folderPrefix")}: ${payload.directory}`;
+    fileStatus.textContent = options.successMessage
+      ? `${options.successMessage}. ${tr("folderPrefix")}: ${payload.directory}`
+      : `${tr("folderPrefix")}: ${payload.directory}`;
     fileList.replaceChildren();
 
-    if (!payload.files.length) {
+    const files = Array.isArray(payload.files) ? [...payload.files] : [];
+    files.sort((a, b) => {
+      const aPinned = pinNames.has(a.name) ? 1 : 0;
+      const bPinned = pinNames.has(b.name) ? 1 : 0;
+      if (aPinned !== bPinned) return bPinned - aPinned;
+      return (b.modified || 0) - (a.modified || 0);
+    });
+
+    if (!files.length) {
       const emptyItem = document.createElement("p");
       emptyItem.className = "hint";
       emptyItem.textContent = "No files yet.";
@@ -784,9 +912,12 @@ async function refreshFileList() {
       return;
     }
 
-    for (const item of payload.files) {
+    for (const item of files) {
       const row = document.createElement("div");
       row.className = "file-item";
+      if (highlightNames.has(item.name) || recentUploadedFiles.has(item.name)) {
+        row.classList.add("file-item-new");
+      }
 
       const meta = document.createElement("div");
       meta.className = "file-meta";
@@ -809,40 +940,124 @@ async function refreshFileList() {
       remove.disabled = item.type === "folder";
       remove.addEventListener("click", async () => {
         await fetch(`/api/files/${encodeURIComponent(item.name)}`, { method: "DELETE" });
+        recentUploadedFiles.delete(item.name);
         refreshFileList();
       });
       actions.append(download, remove);
       row.append(meta, actions);
       fileList.append(row);
     }
+
+    const firstPinned = fileList.querySelector(".file-item-new");
+    if (firstPinned) firstPinned.scrollIntoView({ block: "nearest" });
   } catch (error) {
     fileStatus.textContent = `File list failed: ${error.message}`;
   }
 }
 
 async function uploadFiles(files) {
-  const queue = Array.from(files || []).filter((file) => file && file.name);
+  const queue = normalizeUploadQueue(files);
   if (!queue.length) {
-    fileStatus.textContent = "Choose or drop a file first.";
+    setUploadStatus("Choose or drop a file first.", "error");
     return;
   }
 
   let uploaded = 0;
+  const uploadedNames = [];
   for (const file of queue) {
     const uploadName = uploadFileName(file, uploaded);
-    fileStatus.textContent = `Uploading ${uploadName} (${uploaded + 1}/${queue.length})...`;
-    const response = await fetch(`/api/files?name=${encodeURIComponent(uploadName)}`, {
-      method: "POST",
-      headers: { "content-type": "application/octet-stream" },
-      body: await file.arrayBuffer(),
-    });
-    if (!response.ok) throw new Error(`${uploadName}: HTTP ${response.status}`);
+    const result = await uploadSingleFile(file, uploadName, uploaded + 1, queue.length);
+    const finalName = result?.name || uploadName;
+    uploadedNames.push(finalName);
+    recentUploadedFiles.add(finalName);
+    setTimeout(() => recentUploadedFiles.delete(finalName), 30000);
     uploaded += 1;
   }
 
   fileInput.value = "";
-  fileStatus.textContent = `Uploaded ${uploaded} file${uploaded === 1 ? "" : "s"} to Desktop.`;
-  refreshFileList();
+  const doneMessage = uploadedFileMessage(uploadedNames);
+  setUploadStatus(`${doneMessage}. Refreshing list...`, "success");
+  await refreshFileList({
+    highlightNames: uploadedNames,
+    pinNames: uploadedNames,
+    successMessage: doneMessage,
+  });
+  setUploadStatus(doneMessage, "success");
+}
+
+async function uploadSingleFile(file, uploadName, itemIndex, itemTotal) {
+  const directLimit = 8 * 1024 * 1024;
+  const statusForPercent = (percent) =>
+    `Uploading ${uploadName} ${Math.max(0, Math.min(100, Math.round(percent)))}%... (${itemIndex}/${itemTotal})`;
+  if (file.size <= directLimit) {
+    setUploadStatus(statusForPercent(0));
+    const response = await xhrUpload(
+      `/api/files?name=${encodeURIComponent(uploadName)}`,
+      file,
+      uploadName,
+      (loaded, total) => {
+        const percent = total > 0 ? (loaded / total) * 100 : 0;
+        setUploadStatus(statusForPercent(percent));
+      },
+    );
+    setUploadStatus(statusForPercent(100));
+    if (!response.ok) throw new Error(await uploadErrorMessage(response, uploadName));
+    return response.json();
+  }
+
+  const chunkSize = 8 * 1024 * 1024;
+  const totalChunks = Math.ceil(file.size / chunkSize);
+  const uploadId =
+    `${Date.now()}-${Math.random().toString(36).slice(2)}-${uploadName}`.replace(/[^A-Za-z0-9_.-]/g, "_");
+  let finalPayload = null;
+
+  for (let index = 0; index < totalChunks; index += 1) {
+    const start = index * chunkSize;
+    const end = Math.min(file.size, start + chunkSize);
+    setUploadStatus(statusForPercent((start / file.size) * 100));
+    const response = await xhrUpload(
+      `/api/files/chunk?name=${encodeURIComponent(uploadName)}&upload_id=${encodeURIComponent(uploadId)}&index=${index}&total=${totalChunks}`,
+      file.slice(start, end),
+      uploadName,
+      (loaded) => {
+        const percent = file.size > 0 ? ((start + loaded) / file.size) * 100 : 100;
+        setUploadStatus(statusForPercent(percent));
+      },
+    );
+    if (!response.ok) throw new Error(await uploadErrorMessage(response, uploadName));
+    finalPayload = await response.json();
+  }
+
+  if (!finalPayload?.complete) {
+    throw new Error(`${uploadName}: upload did not finish`);
+  }
+  return finalPayload;
+}
+
+async function uploadErrorMessage(response, uploadName) {
+  let detail = "";
+  try {
+    const payload = await response.json();
+    detail = payload.detail ? ` - ${payload.detail}` : "";
+  } catch {
+    try {
+      detail = ` - ${await response.text()}`;
+    } catch {
+      detail = "";
+    }
+  }
+  return `${uploadName}: HTTP ${response.status}${detail}`;
+}
+
+function showUploadError(error) {
+  const message = error?.message || String(error);
+  const timedOut = /timed out|abort/i.test(message);
+  setUploadStatus(
+    timedOut
+      ? `Upload timed out. Refresh or drop the file again. (${message})`
+      : `Upload failed: ${message}`,
+    "error",
+  );
 }
 
 function fileExtension(file) {
@@ -855,6 +1070,12 @@ function fileExtension(file) {
   return "bin";
 }
 
+function uploadFallbackName(file, index = 0) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const ext = fileExtension(file);
+  return `${(file.type || "").startsWith("image/") ? "screenshot" : "file"}-${stamp}${index ? `-${index + 1}` : ""}.${ext}`;
+}
+
 function isGeneratedImageName(name) {
   return /(_cgi-bin|webwxgetmsgimg|msgid=|skey=|wx_webfilehelper|clipboard)/i.test(name || "");
 }
@@ -862,28 +1083,56 @@ function isGeneratedImageName(name) {
 function uploadFileName(file, index = 0) {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   const ext = fileExtension(file);
+  if (!file.name) {
+    return uploadFallbackName(file, index);
+  }
   if ((file.type || "").startsWith("image/") && isGeneratedImageName(file.name)) {
     return `image-${stamp}${index ? `-${index + 1}` : ""}.${ext}`;
   }
   return file.name || `file-${stamp}${index ? `-${index + 1}` : ""}.${ext}`;
 }
 
+function normalizeUploadQueue(files) {
+  const normalized = [];
+  const seen = new Set();
+  for (const [index, file] of Array.from(files || []).entries()) {
+    if (!file || typeof file.size !== "number") continue;
+    const fallbackName = uploadFileName(file, index);
+    const name = file.name && !isGeneratedImageName(file.name) ? file.name : fallbackName;
+    const key = `${name}|${file.size}|${file.type || ""}|${file.lastModified || 0}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (file.name === name) {
+      normalized.push(file);
+    } else {
+      normalized.push(new File([file], name, { type: file.type || "application/octet-stream" }));
+    }
+  }
+  return normalized;
+}
+
 function clipboardFiles(event) {
   const files = [];
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  for (const file of Array.from(event.clipboardData?.files || [])) {
-    if (file.name) files.push(file);
-  }
+  const seen = new Set();
+  const addFile = (file) => {
+    if (!file) return;
+    const key = `${file.size}|${file.type || ""}|${file.lastModified || 0}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    files.push(file);
+  };
+  for (const file of Array.from(event.clipboardData?.files || [])) addFile(file);
   for (const item of Array.from(event.clipboardData?.items || [])) {
     if (item.kind !== "file") continue;
     const file = item.getAsFile();
     if (!file) continue;
     if (file.name && !isGeneratedImageName(file.name)) {
-      files.push(file);
+      addFile(file);
       continue;
     }
     const ext = file.type === "image/jpeg" ? "jpg" : file.type === "image/webp" ? "webp" : "png";
-    files.push(new File([file], `clipboard-${stamp}.${ext}`, { type: file.type || "image/png" }));
+    addFile(new File([file], `clipboard-${stamp}.${ext}`, { type: file.type || "image/png" }));
   }
   return files;
 }
@@ -891,14 +1140,45 @@ function clipboardFiles(event) {
 async function uploadClipboardFiles(event) {
   const files = clipboardFiles(event);
   if (!files.length) return false;
+  clearPasteFallback();
   event.preventDefault();
   event.stopPropagation();
   try {
     await uploadFiles(files);
   } catch (error) {
-    fileStatus.textContent = `Upload failed: ${error.message}`;
+    showUploadError(error);
   }
   return true;
+}
+
+function clearPasteFallback() {
+  if (pasteFallbackTimer) {
+    clearTimeout(pasteFallbackTimer);
+    pasteFallbackTimer = null;
+  }
+}
+
+function schedulePasteFallback() {
+  clearPasteFallback();
+  pasteFallbackTimer = setTimeout(() => {
+    pasteFallbackTimer = null;
+    if (imeInput.value) {
+      const text = imeInput.value;
+      imeInput.value = "";
+      sendControl({ kind: "text", text });
+      setStatus(`Pasted ${text.length} chars to remote`, true);
+      return;
+    }
+    pasteLocalClipboard();
+  }, 180);
+}
+
+function scheduleRemoteClipboardProbe(delay = 350) {
+  if (clipboardProbeTimer) clearTimeout(clipboardProbeTimer);
+  clipboardProbeTimer = setTimeout(() => {
+    clipboardProbeTimer = null;
+    sendControlRaw({ kind: "read_clipboard" });
+  }, delay);
 }
 
 function handleRemoteShortcut(event) {
@@ -927,7 +1207,13 @@ function handleRemoteShortcut(event) {
   if (key === "v" || code === "KeyV") {
     event.preventDefault();
     event.stopImmediatePropagation();
-    pasteLocalClipboard();
+    if (event.metaKey && !event.ctrlKey) {
+      sendControl({ kind: "hotkey", keys: ["command", "v"] });
+      setStatus("Remote Command+V sent", true);
+    } else {
+      focusRemoteInput();
+      schedulePasteFallback();
+    }
     return true;
   }
 
@@ -968,6 +1254,13 @@ function connect(room, secret) {
   if (socket) socket.close();
   if (controlSocket) controlSocket.close();
   closeWebRtc();
+  hasBaseFrame = false;
+  pendingFrame = null;
+  pendingFrameDrops = 0;
+  lastFullFrameRequestAt = 0;
+  if (screenImg.width || screenImg.height) {
+    screenCtx.clearRect(0, 0, screenImg.width, screenImg.height);
+  }
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
   const url = `${protocol}//${location.host}/ws/controller/${encodeURIComponent(room)}?secret=${encodeURIComponent(secret)}`;
   const controlUrl = `${protocol}//${location.host}/ws/controller_control/${encodeURIComponent(room)}?secret=${encodeURIComponent(secret)}`;
@@ -976,12 +1269,14 @@ function connect(room, secret) {
   controlSocket = new WebSocket(controlUrl);
   controlSocket.addEventListener("open", () => {
     sendStreamMode(currentStreamMode);
+    requestFullFrame(true);
     startWebRtc(room, secret);
   });
   controlSocket.addEventListener("message", (event) => {
     if (typeof event.data !== "string") return;
     const payload = JSON.parse(event.data);
-    if (payload.type === "clipboard") receiveRemoteClipboard(payload.text || "");
+  if (payload.type === "clipboard") receiveRemoteClipboard(payload.text || "");
+    if (payload.type === "clipboard_status") receiveRemoteClipboardStatus(payload.text || "");
   });
 
   socket.addEventListener("open", () => setStatus("Connected to relay, waiting for host", true));
@@ -998,15 +1293,24 @@ function connect(room, secret) {
         setStatus(payload.online ? "Host online" : "Host offline", payload.online);
         if (payload.online && controlSocket?.readyState === WebSocket.OPEN) {
           sendStreamMode(currentStreamMode);
+          requestFullFrame(true);
         }
       } else if (payload.type === "error") {
         setStatus(payload.message, false);
       } else if (payload.type === "clipboard") {
         receiveRemoteClipboard(payload.text || "");
+      } else if (payload.type === "clipboard_status") {
+        receiveRemoteClipboardStatus(payload.text || "");
       }
       return;
     }
 
+    const header = peekFrameHeader(event.data);
+    if (partialFrameNeedsBase(header)) {
+      pendingFrameDrops += 1;
+      requestFullFrame();
+      return;
+    }
     if (pendingFrame) pendingFrameDrops += 1;
     pendingFrame = event.data;
     if (!framePaintScheduled) {
@@ -1028,6 +1332,24 @@ async function decodeFrame(buffer) {
     blob,
     bitmap: await createImageBitmap(blob),
   };
+}
+
+function peekFrameHeader(buffer) {
+  try {
+    const view = new DataView(buffer);
+    const headerLength = view.getUint32(0);
+    const headerBytes = new Uint8Array(buffer, 4, headerLength);
+    return JSON.parse(textDecoder.decode(headerBytes));
+  } catch {
+    return null;
+  }
+}
+
+function partialFrameNeedsBase(header) {
+  return (
+    header?.full === false &&
+    (!hasBaseFrame || screenImg.width !== header.width || screenImg.height !== header.height)
+  );
 }
 
 async function paintLatestFrame() {
@@ -1072,16 +1394,27 @@ async function paintLatestFrame() {
   screenWrap.style.setProperty("--screen-ratio", `${header.width} / ${header.height}`);
 
   const fullFrame = header.full !== false;
+  const canvasNeedsResize = screenImg.width !== header.width || screenImg.height !== header.height;
+  if (!fullFrame && (!hasBaseFrame || canvasNeedsResize)) {
+    bitmap.close();
+    requestFullFrame();
+    if (pendingFrame) {
+      framePaintScheduled = true;
+      requestAnimationFrame(paintLatestFrame);
+    }
+    return;
+  }
   const regionX = Math.max(0, Math.floor(header.regionX || 0));
   const regionY = Math.max(0, Math.floor(header.regionY || 0));
   const regionWidth = Math.max(1, Math.floor(header.regionWidth || header.width));
   const regionHeight = Math.max(1, Math.floor(header.regionHeight || header.height));
-  if (screenImg.width !== header.width || screenImg.height !== header.height || fullFrame) {
+  if (canvasNeedsResize || fullFrame) {
     if (screenImg.width !== header.width) screenImg.width = header.width;
     if (screenImg.height !== header.height) screenImg.height = header.height;
     if (fullFrame) screenCtx.clearRect(0, 0, header.width, header.height);
   }
   screenCtx.drawImage(bitmap, regionX, regionY, regionWidth, regionHeight);
+  if (fullFrame) hasBaseFrame = true;
   bitmap.close();
   const paintMs = performance.now() - paintStart;
   sendStreamFeedback({
@@ -1118,6 +1451,7 @@ async function receiveRemoteClipboard(text) {
     setStatus("Remote copy returned no text", false);
     return;
   }
+  lastRemoteClipboardText = text;
   clipboardBox.value = text;
   try {
     await navigator.clipboard.writeText(text);
@@ -1127,15 +1461,58 @@ async function receiveRemoteClipboard(text) {
   }
 }
 
+async function receiveRemoteClipboardStatus(text) {
+  const value = text || "";
+  const preview = value.replace(/\s+/g, " ").slice(0, 64);
+  if (!value) {
+    setStatus("Remote clipboard is empty", false);
+    return;
+  }
+  clipboardBox.value = value;
+  if (value !== lastRemoteClipboardText) {
+    lastRemoteClipboardText = value;
+    try {
+      await navigator.clipboard.writeText(value);
+      setStatus(`Remote clipboard synced: ${preview}${value.length > 64 ? "..." : ""}`, true);
+      return;
+    } catch {
+      setStatus(`Remote clipboard changed: ${preview}${value.length > 64 ? "..." : ""}`, true);
+      return;
+    }
+  }
+  setStatus(`Remote clipboard now: ${preview}${value.length > 64 ? "..." : ""}`, true);
+}
+
 async function pasteLocalClipboard() {
   const fallback = clipboardBox.value || textInput.value;
   try {
     const text = await navigator.clipboard.readText();
-    if (text) sendControl({ kind: "text", text });
-    else if (fallback) sendControl({ kind: "text", text: fallback });
+    if (text) {
+      sendControl({ kind: "text", text });
+      setStatus(`Pasted ${text.length} chars to remote`, true);
+    } else if (fallback) {
+      sendControl({ kind: "text", text: fallback });
+      setStatus(`Pasted ${fallback.length} chars to remote`, true);
+    }
   } catch {
-    if (fallback) sendControl({ kind: "text", text: fallback });
+    if (fallback) {
+      sendControl({ kind: "text", text: fallback });
+      setStatus(`Pasted ${fallback.length} chars to remote`, true);
+    } else {
+      setStatus("Clipboard permission blocked. Press paste again with the remote screen focused.", false);
+    }
   }
+}
+
+function shouldTreatAsUserActivity(event) {
+  if (!event || !event.kind) return false;
+  if (event.kind === "move") return mouseIsDown;
+  return ![
+    "stream_feedback",
+    "request_full_frame",
+    "jpeg_stream",
+    "read_clipboard",
+  ].includes(event.kind);
 }
 
 function sendControl(event, immediate = false) {
@@ -1160,7 +1537,7 @@ function sendControl(event, immediate = false) {
   }
   const target = controlSocket?.readyState === WebSocket.OPEN ? controlSocket : socket;
   if (!target || target.readyState !== WebSocket.OPEN) return;
-  if (adaptiveSmoothEnabled) {
+  if (adaptiveSmoothEnabled && shouldTreatAsUserActivity(event)) {
     markUserActivity();
     applyInteractiveProfileForControl();
   }
@@ -1169,6 +1546,12 @@ function sendControl(event, immediate = false) {
 
 function sendStreamMode(mode) {
   const subs = mode.jpegSubsampling === 0 ? 0 : 2;
+  const previousMode = currentStreamMode;
+  const modeChanged =
+    previousMode.fps !== mode.fps ||
+    previousMode.quality !== mode.quality ||
+    previousMode.maxWidth !== mode.maxWidth ||
+    previousMode.jpegSubsampling !== subs;
   currentStreamMode = { ...mode, jpegSubsampling: subs };
   const payload = {
     type: "control",
@@ -1183,6 +1566,12 @@ function sendStreamMode(mode) {
   const target = controlSocket?.readyState === WebSocket.OPEN ? controlSocket : socket;
   if (target?.readyState === WebSocket.OPEN) {
     target.send(JSON.stringify(payload));
+    if (modeChanged) {
+      hasBaseFrame = false;
+      pendingFrame = null;
+      pendingFrameDrops = 0;
+      requestFullFrame(true);
+    }
   }
   smoothMode.classList.toggle("active", mode.label.startsWith("Smooth"));
   clearMode.classList.toggle("active", mode.label.startsWith("Clear"));
@@ -1245,6 +1634,7 @@ screenImg.addEventListener("mousemove", (event) => {
 
 screenImg.addEventListener("mousedown", (event) => {
   event.preventDefault();
+  positionImeInputFromPointer(event);
   focusRemoteInput();
   mouseIsDown = true;
   sendControl({ kind: "mouse_down", button: event.button === 2 ? "right" : "left", ...normalizedPoint(event) });
@@ -1254,10 +1644,12 @@ screenImg.addEventListener("mouseup", (event) => {
   event.preventDefault();
   mouseIsDown = false;
   sendControl({ kind: "mouse_up", button: event.button === 2 ? "right" : "left", ...normalizedPoint(event) });
+  scheduleRemoteClipboardProbe();
 });
 
 screenImg.addEventListener("click", (event) => {
   event.preventDefault();
+  positionImeInputFromPointer(event);
   focusRemoteInput();
 });
 
@@ -1294,6 +1686,7 @@ webrtcVideo.addEventListener("mousemove", (event) => {
 
 webrtcVideo.addEventListener("mousedown", (event) => {
   event.preventDefault();
+  positionImeInputFromPointer(event);
   focusRemoteInput();
   mouseIsDown = true;
   sendControl({ kind: "mouse_down", button: event.button === 2 ? "right" : "left", ...normalizedPoint(event) });
@@ -1303,10 +1696,12 @@ webrtcVideo.addEventListener("mouseup", (event) => {
   event.preventDefault();
   mouseIsDown = false;
   sendControl({ kind: "mouse_up", button: event.button === 2 ? "right" : "left", ...normalizedPoint(event) });
+  scheduleRemoteClipboardProbe();
 });
 
 webrtcVideo.addEventListener("click", (event) => {
   event.preventDefault();
+  positionImeInputFromPointer(event);
   focusRemoteInput();
 });
 
@@ -1346,31 +1741,48 @@ window.addEventListener("keydown", (event) => {
     return;
   }
 
+  if (document.activeElement === imeInput && isPlainPrintableKey(event)) {
+    event.preventDefault();
+    queueRemoteText(event.key);
+    return;
+  }
+
   if (shortcut && event.key.toLowerCase() === "c") {
     event.preventDefault();
+    flushRemoteTextBuffer();
     sendControl({ kind: "copy" });
     return;
   }
 
   if (shortcut && event.key.toLowerCase() === "x") {
     event.preventDefault();
+    flushRemoteTextBuffer();
     sendControl({ kind: "cut" });
     return;
   }
 
   if (shortcut && event.key.toLowerCase() === "v") {
     event.preventDefault();
-    pasteLocalClipboard();
+    event.stopImmediatePropagation();
+    if (event.metaKey && !event.ctrlKey) {
+      sendControl({ kind: "hotkey", keys: ["command", "v"] });
+      setStatus("Remote Command+V sent", true);
+    } else {
+      focusRemoteInput();
+      schedulePasteFallback();
+    }
     return;
   }
 
   if (shortcut && event.key.toLowerCase() === "a") {
     event.preventDefault();
+    flushRemoteTextBuffer();
     sendControl({ kind: "hotkey", keys: ["ctrl", "a"] });
     return;
   }
 
   event.preventDefault();
+  flushRemoteTextBuffer();
 
   const keys = [];
   if (event.ctrlKey || event.metaKey) keys.push("ctrl");
@@ -1412,6 +1824,18 @@ imeInput.addEventListener("compositionend", (event) => {
 });
 
 imeInput.addEventListener("beforeinput", (event) => {
+  const inputType = (event.inputType || "").toLowerCase();
+  if (inputType === "insertfrompaste") {
+    const text = event.dataTransfer?.getData("text/plain") || event.data || "";
+    if (text) {
+      clearPasteFallback();
+      event.preventDefault();
+      sendControl({ kind: "text", text });
+      setStatus(`Pasted ${text.length} chars to remote`, true);
+      imeInput.value = "";
+    }
+    return;
+  }
   if (event.inputType && event.inputType.toLowerCase().includes("composition")) {
     markImeActivity();
   }
@@ -1429,10 +1853,14 @@ imeInput.addEventListener("paste", async (event) => {
     imeInput.value = "";
     return;
   }
+  clearPasteFallback();
   event.preventDefault();
   event.stopPropagation();
   const text = event.clipboardData?.getData("text/plain") || "";
-  if (text) sendControl({ kind: "text", text });
+  if (text) {
+    sendControl({ kind: "text", text });
+    setStatus(`Pasted ${text.length} chars to remote`, true);
+  }
   imeInput.value = "";
 });
 
@@ -1451,9 +1879,13 @@ document.addEventListener("cut", (event) => {
 document.addEventListener("paste", async (event) => {
   if (isLocalEditingTarget() || !enableInput.checked) return;
   if (await uploadClipboardFiles(event)) return;
+  clearPasteFallback();
   event.preventDefault();
   const text = event.clipboardData?.getData("text/plain") || clipboardBox.value || textInput.value;
-  if (text) sendControl({ kind: "text", text });
+  if (text) {
+    sendControl({ kind: "text", text });
+    setStatus(`Pasted ${text.length} chars to remote`, true);
+  }
 });
 
 sendCtrlAltDel.addEventListener("click", () => {
@@ -1535,7 +1967,7 @@ uploadFile.addEventListener("click", async () => {
   try {
     await uploadFiles(fileInput.files);
   } catch (error) {
-    fileStatus.textContent = `Upload failed: ${error.message}`;
+    showUploadError(error);
   }
 });
 
@@ -1563,7 +1995,7 @@ for (const dropTarget of [document.body, screenWrap, screenImg, webrtcVideo]) {
     try {
       await uploadFiles(event.dataTransfer.files);
     } catch (error) {
-      fileStatus.textContent = `Upload failed: ${error.message}`;
+      showUploadError(error);
     }
   });
 }
@@ -1593,6 +2025,7 @@ window.addEventListener("mouseup", (event) => {
   mouseIsDown = false;
   if (event.target === screenImg || event.target === webrtcVideo) return;
   sendControl({ kind: "mouse_up", button: "left", ...normalizedPoint(event) });
+  scheduleRemoteClipboardProbe();
 });
 
 document.querySelectorAll("input[name='netPath']").forEach((el) => {

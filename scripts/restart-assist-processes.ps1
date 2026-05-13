@@ -2,7 +2,6 @@ $ErrorActionPreference = 'Stop'
 $py = 'c:\apps\remote-assist-launcher\bundled-runtime\win\python-runtime\python.exe'
 $wd = 'c:\apps\remote-assist-launcher\assist-bundle'
 $settingsPath = 'C:\Users\Administrator\AppData\Roaming\remote-assist-launcher\settings.json'
-$files = 'C:\Users\Administrator\AppData\Roaming\remote-assist-launcher\RemoteAssistFiles'
 
 Get-CimInstance Win32_Process -Filter "name='python.exe'" |
   Where-Object { $_.CommandLine -match 'remote_assist' } |
@@ -11,10 +10,6 @@ Get-CimInstance Win32_Process -Filter "name='python.exe'" |
     Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
   }
 Start-Sleep -Seconds 2
-
-if (-not (Test-Path $files)) {
-  New-Item -ItemType Directory -Path $files -Force | Out-Null
-}
 
 $s = Get-Content $settingsPath -Raw | ConvertFrom-Json
 $fps = [int]$s.fps
@@ -29,7 +24,7 @@ if ($null -ne $s.jpegSubsampling) { $jss = [int]$s.jpegSubsampling }
 if ($jss -ne 0) { $jss = 2 }
 
 Write-Host 'Starting remote_assist.server...'
-$env:REMOTE_ASSIST_FILES_DIR = $files
+Remove-Item Env:\REMOTE_ASSIST_FILES_DIR -ErrorAction SilentlyContinue
 Start-Process -FilePath $py -ArgumentList @('-m', 'remote_assist.server') -WorkingDirectory $wd -WindowStyle Hidden
 Start-Sleep -Seconds 3
 
@@ -44,7 +39,7 @@ $args = @(
   '--max-width', "$mw",
   '--jpeg-subsampling', "$jss"
 )
-$env:REMOTE_ASSIST_FILES_DIR = $files
+Remove-Item Env:\REMOTE_ASSIST_FILES_DIR -ErrorAction SilentlyContinue
 Start-Process -FilePath $py -ArgumentList $args -WorkingDirectory $wd -WindowStyle Hidden
 Start-Sleep -Seconds 2
 
